@@ -331,19 +331,109 @@ export function classifyMove(
   return "blunder";
 }
 
-// ── FIX #1 + #2: isBrilliantMove ─────────────────────────────────────────────
+// ── FIX #6: isKingHuntBrilliant — forcing check + king dipaksa jalan ─────────
+// + only-good-move ─────────────────────────────────────────────────────────
+//
+// Kasus seperti exf2+ / fxg1=N+ bukan material sacrifice (lihat detectSacrifice
+// yang sudah di-fix — immediateNetLoss-nya malah negatif/untung material).
+// Tapi mereka tetap bisa "brilliant" lewat jalur lain: forcing check yang
+// memaksa raja lawan keluar dari shelter-nya, DAN merupakan satu-satunya
+// (atau jauh lebih baik dari alternatif kedua) cara pemain aktif menjaga
+// keunggulan besarnya.
+//
+// PENTING: gap di sini WAJIB diukur dari pvLinesBeforeWhite (PV milik
+// PEMAIN AKTIF di posisi SEBELUM move ini dimainkan) — bukan dari PV
+// lawan setelah move dimainkan. Itu kesalahan yang sebelumnya bikin Ke2
+// (raja jalan biasa, tidak forcing) numpang lolos jadi brilliant hanya
+// karena posisi lawan kebetulan tajam. Forcing check + king move target
+// memastikan kita hanya menilai move yang benar-benar menciptakan paksaan,
+// dan gap dari pvLinesBeforeWhite memastikan gap itu milik keputusan
+// pemain aktif sendiri, bukan posisi lawan belakangan.
+export function isKingHuntBrilliant(
+  san: string,
+  cpLoss: number,
+  cpBeforeWhite: number, // eval SEBELUM move ini, perspektif putih
+  pvLinesBeforeWhite: PVLine[], // dari evalBefore — PV milik pemain aktif
+  fenBeforeMove: string,
+  fenAfterMove: string,
+): boolean {
+  // 1) Harus forcing: check atau checkmate
+  const isCheck = san.includes("+") || san.includes("#");
+  if (!isCheck) return false;
+
+  // 2) cpLoss harus kecil — move ini gak boleh ngerugiin posisi sendiri.
+  //    Toleransi 30 — konsisten dengan jalur sacrifice di isBrilliantMove
+  //    (search depth terbatas kadang belum nangkep penuh keuntungan
+  //    king-hunt di evalAfter, jadi cpLoss sedikit di atas "perfect" masih
+  //    wajar untuk move yang genuinely forcing+decisive, mis. fxg1=N+
+  //    cpLoss=27 — masih bagian dari rangkaian king-hunt yang sama).
+  if (cpLoss > 30) return false;
+
+  // 2b) FIX #7: posisi SEBELUM move ini belum boleh sudah settled/extreme
+  // (mendekati mate-level, mis. |cp| >= 900). Kalau posisi udah segede itu
+  // sebelum move dimainkan, berarti keunggulan/mate-nya udah "diciptakan"
+  // oleh blunder lawan sebelumnya — move ini cuma nerusin/mengeksekusi
+  // mate yang udah pasti, bukan menciptakan sesuatu yang baru. Itu pantas
+  // dapet "best", bukan "brilliant". Brilliant harus jadi move yang
+  // mengubah posisi DARI belum-pasti-menang KE menang telak, bukan
+  // sekadar eksekusi forced-mate yang udah jelas dari posisi sebelumnya.
+  const SETTLED_THRESHOLD = 900;
+  if (Math.abs(cpBeforeWhite) >= SETTLED_THRESHOLD) return false;
+
+  // 3) Raja lawan harus benar-benar terpaksa pindah dari posisi awal/shelter-nya.
+  //    Bandingkan posisi raja lawan SEBELUM move ini vs SETELAH beberapa ply
+  //    (di sini cukup cek apakah raja lawan sudah tidak di kotak starting-nya
+  //    atau castled position pada fenAfterMove — proxy sederhana: raja lawan
+  //    pindah kotak akibat check ini).
+  const beforeBoard = fenBeforeMove.split(" ")[0];
+  const afterBoard = fenAfterMove.split(" ")[0];
+  const isWhiteMoving = fenBeforeMove.includes(" w ");
+  const oppKingChar = isWhiteMoving ? "k" : "K"; // raja LAWAN dari yang gerak
+
+  const findKingSquareIdx = (board: string, kingChar: string): number =>
+    board.indexOf(kingChar);
+
+  const kingMovedAlready =
+    findKingSquareIdx(beforeBoard, oppKingChar) !==
+    findKingSquareIdx(afterBoard, oppKingChar);
+
+  // Check ini sendiri belum memindahkan raja (raja pindah di balasan
+  // berikutnya), tapi kalau check-nya datang dari move yang membuka/menyerang
+  // langsung raja yang masih di posisi awal, itu valid sebagai king-hunt
+  // trigger. kingMovedAlready true berarti situasi sudah berubah duluan
+  // (mis. raja sudah pernah kena force-move sebelumnya) — masih oke, kita
+  // tidak strict-reject di sini, cukup sebagai sinyal tambahan non-blocking.
+  void kingMovedAlready;
+
+  // 4) Only-good-move: harus jauh lebih baik dari alternatif kedua, diukur
+  //    dari PV milik pemain aktif SENDIRI sebelum move dimainkan.
+  if (pvLinesBeforeWhite.length < 2) return false;
+  const pv1 = pvLinesBeforeWhite[0]?.cp ?? 0;
+  const pv2 = pvLinesBeforeWhite[1]?.cp ?? 0;
+  const gap = Math.abs(pv1 - pv2);
+
+  return gap > 200;
+}
+
+// ── FIX #1 + #2 + #5: isBrilliantMove ─────────────────────────────────────────
 //
 // PERUBAHAN:
 //   - Terima pvLinesAfterWhite (dari evalAfter, bukan evalBefore)
-//   - Dua jalur: sacrifice (gap>150) ATAU quiet only-move (gap>300, lebih ketat)
-//
-// FIX tambahan pada jalur Quiet only-move: threshold decisiveness dinaikkan
-// dari Math.abs(cpAfterWhite) > 200 ke > 500. Alasannya: >200 menangkap
-// posisi yang cuma "masih playable/unggul tipis" (mis. +250), bukan posisi
-// yang benar-benar decisive/winning (mis. +900). Brilliant non-sacrifice
-// harus lebih ketat karena nggak ada "korban material" yang membuktikan
-// kreativitasnya — satu-satunya bukti kekuatan move ini ya keputusan final
-// posisinya, jadi itu harus benar-benar jelas menang, bukan cuma unggul.
+//   - HANYA jalur sacrifice. Jalur "quiet only-move" yang lama DIHAPUS:
+//     pv1/pv2 di sini berasal dari pvLinesAfterWhite, yaitu kandidat milik
+//     LAWAN di posisi setelah move ini dimainkan (giliran sudah pindah).
+//     Gap besar antar pv1/pv2 di sana cuma berarti "posisi lawan tajam/dia
+//     punya 1 jawaban jauh lebih baik dari yang lain" — itu bukan bukti
+//     move kita sendiri istimewa. Itu sebabnya raja yang jalan biasa
+//     (Ke2) ikut numpang lolos jadi "brilliant" tiap kali posisi udah
+//     lopsided dari sacrifice sebelumnya. Only-move genuinely-brilliant
+//     non-sacrifice, non-forcing-check sekarang ditangani isKingHuntBrilliant
+//     terpisah (lihat di atas) dengan PV dari sisi yang benar (sebelum move).
+//   - Toleransi cpLoss jalur sacrifice dilonggarkan 10 → 25. Sacrifice
+//     riil (terutama exchange/piece sac dengan kompensasi tidak instan)
+//     sering punya cpLoss 10-25 karena search depth terbatas belum
+//     "melihat" kompensasi penuh di evalAfter — threshold 10 terlalu
+//     ketat dan nge-reject sacrifice yang valid.
 //
 // PENTING: caller (chessAnalyzer.ts buildMoveAnalysis) harus kirim
 //          evalAfter.pvLines ke parameter ini, bukan evalBefore.pvLines.
@@ -354,30 +444,21 @@ export function isBrilliantMove(
   pvLinesAfterWhite: PVLine[], // dari evalAfter
   isSacrifice: boolean,
 ): boolean {
+  if (!isSacrifice) return false;
   if (pvLinesAfterWhite.length < 2) return false;
+  if (cpLoss > 25) return false;
+
+  console.log(
+    "log dari function isBrilliantMove: dari parameter cpAfterWhite: ",
+    cpAfterWhite,
+  );
 
   const pv1 = pvLinesAfterWhite[0]?.cp ?? 0;
   const pv2 = pvLinesAfterWhite[1]?.cp ?? 0;
   const gap = Math.abs(pv1 - pv2);
 
-  // Jalur A — Sacrifice brilliant: material dilepas, posisi decisive
-  if (isSacrifice && cpLoss <= 10 && gap > 150) {
-    return true;
-  }
-
-  // Jalur B — Quiet only-move brilliant: tidak sacrifice tapi satu-satunya move.
-  // FIX: threshold decisiveness naik 200 → 500, supaya nggak nyangkut di
-  // posisi yang cuma "unggul tipis" — harus benar-benar winning/losing jelas.
-  if (
-    !isSacrifice &&
-    cpLoss <= 5 &&
-    gap > 300 &&
-    Math.abs(cpAfterWhite) > 500
-  ) {
-    return true;
-  }
-
-  return false;
+  // Sacrifice brilliant: material dilepas, posisi tetap/makin decisive
+  return gap > 150;
 }
 
 // ── FIX #3b: isGreatMove — gap threshold naik 120→200 ────────────────────────

@@ -21,6 +21,7 @@ import type { MoveAnalysis, AnalysisData, PVLine, MoveGrade } from "../types";
 import {
   classifyMove,
   isBrilliantMove,
+  isKingHuntBrilliant,
   isGreatMove,
   detectOpening,
   detectPhase,
@@ -312,7 +313,7 @@ function clampCp(cp: number): number {
  */
 function detectSacrifice(
   fenBeforeMove: string,
-  fenAfterMove: string, // FIX: posisi nyata setelah langkah ini dimainkan
+  fenAfterMove: string, // posisi nyata setelah langkah ini dimainkan
   pvContinuationUci: string[], // PV dari evalAfter (posisi setelah langkah ini)
   isWhite: boolean,
   projectionPlies: number = 6, // proyeksi ~3 langkah penuh ke depan
@@ -321,12 +322,63 @@ function detectSacrifice(
   type: "piece" | "exchange" | "pawn" | null;
   netLoss: number;
 } {
-  const before = countMaterialFromFen(fenBeforeMove);
-  const ownBefore = isWhite ? before.white : before.black;
-  const oppBefore = isWhite ? before.black : before.white;
+  // FIX BUG #5 (sacrifice attribution):
+  // Versi sebelumnya ngukur delta material dari fenBeforeMove sampai posisi
+  // N-ply SETELAH move ini, lalu nge-atribusikan SELURUH perubahan itu ke
+  // move yang sedang dianalisis. Itu salah: kalau lawan, beberapa ply
+  // kemudian, melakukan capture/promosi/exchange yang sama sekali gak
+  // terkait keputusan move ini (mis. Ke2 cuma mindahin raja, gak capture
+  // apa-apa, tapi 2 ply kemudian lawan promosi pion lalu promosinya
+  // ketangkep balik), delta itu ke-hitung sebagai "sacrifice milik Ke2" —
+  // padahal Ke2 sendiri tidak melepas material apa pun secara langsung.
+  //
+  // Fix: pisahkan dua hal:
+  //   1) immediateDelta = delta material PERSIS pada move ini saja
+  //      (fenBeforeMove → fenAfterMove, satu ply). Ini nilai material
+  //      yang BENAR-BENAR dilepas oleh move itu sendiri.
+  //   2) Proyeksi PV tetap dipakai, tapi HANYA untuk mengonfirmasi bahwa
+  //      material yang dilepas pada immediateDelta tidak langsung
+  //      dikembalikan/diimbangi balik dalam beberapa ply ke depan (jadi
+  //      bukan exchange biasa yang udah seimbang instan). Proyeksi TIDAK
+  //      dipakai untuk menambah delta baru — kalau immediateDelta = 0
+  //      (tidak ada apa pun yang hilang pada move ini), hasilnya selalu
+  //      bukan sacrifice, apa pun yang terjadi di ply-ply berikutnya.
+  const beforeImmediate = countMaterialFromFen(fenBeforeMove);
+  const afterImmediate = countMaterialFromFen(fenAfterMove);
 
-  // FIX: simulasi mulai dari fenAfterMove (giliran lawan), karena PV dari
-  // evalAfter dihasilkan dari posisi itu — ply pertama PV adalah balasan lawan.
+  const ownBeforeImmediate = isWhite
+    ? beforeImmediate.white
+    : beforeImmediate.black;
+  const ownAfterImmediate = isWhite
+    ? afterImmediate.white
+    : afterImmediate.black;
+  const oppBeforeImmediate = isWhite
+    ? beforeImmediate.black
+    : beforeImmediate.white;
+  const oppAfterImmediate = isWhite
+    ? afterImmediate.black
+    : afterImmediate.white;
+
+  // Material milik pemain aktif yang hilang TEPAT pada move ini (mis. blunder
+  // piece, atau material lawan yang dia tangkap dikurangi material sendiri
+  // yang lenyap kalau movenya sendiri sebuah capture-trade).
+  const ownImmediateLoss = ownBeforeImmediate - ownAfterImmediate;
+  const oppImmediateLoss = oppBeforeImmediate - oppAfterImmediate;
+  const immediateNetLoss = ownImmediateLoss - oppImmediateLoss;
+
+  // Kalau move ini sendiri tidak melepas material apa pun secara net
+  // (immediateNetLoss <= 0, mis. Ke2 yang cuma jalan biasa, atau capture
+  // yang langsung untung/seimbang), ini bukan sacrifice — titik. Proyeksi
+  // PV tidak relevan lagi karena apa pun yang lawan lakukan setelahnya
+  // adalah keputusan lawan, bukan korban dari move ini.
+  if (immediateNetLoss <= 0) {
+    return { isSacrifice: false, type: null, netLoss: 0 };
+  }
+
+  // Move ini melepas material secara net. Sekarang proyeksikan PV untuk
+  // cek apakah pemain aktif langsung dapat balik material itu (kompensasi
+  // instan dalam beberapa ply) — kalau iya, ini exchange biasa, bukan
+  // sacrifice yang genuinely "belum diganti".
   const chess = new Chess(fenAfterMove);
   let plies = 0;
   for (const uciMove of pvContinuationUci) {
@@ -346,13 +398,21 @@ function detectSacrifice(
   const ownProjected = isWhite ? projected.white : projected.black;
   const oppProjected = isWhite ? projected.black : projected.white;
 
-  const ownDelta = ownBefore - ownProjected; // > 0 = pemain aktif net rugi piece
-  const oppDelta = oppBefore - oppProjected; // > 0 = lawan net rugi piece
-  const netLoss = ownDelta - oppDelta;
+  // Delta total dari SEBELUM move ini sampai akhir proyeksi, dibandingkan
+  // terhadap delta immediate — supaya kita tau apakah ada kompensasi
+  // tambahan yang masuk SETELAH move ini (bagian dari rencana taktis yang
+  // sama), bukan aksi independen lawan yang gak nyambung ke move ini.
+  const ownTotalLoss = ownBeforeImmediate - ownProjected;
+  const oppTotalLoss = oppBeforeImmediate - oppProjected;
+  const netLoss = ownTotalLoss - oppTotalLoss;
 
+  // Net loss akhir minimal harus >= immediate net loss (material yang
+  // dilepas move ini sendiri) — kalau proyeksi malah menunjukkan net loss
+  // mengecil signifikan (banyak terkompensasi), turunkan ke tipe yang lebih
+  // rendah sesuai netLoss aktual hasil proyeksi, bukan immediateNetLoss.
   if (netLoss >= 3) return { isSacrifice: true, type: "piece", netLoss };
   if (netLoss === 2) return { isSacrifice: true, type: "exchange", netLoss };
-  if (netLoss === 1) return { isSacrifice: true, type: "pawn", netLoss };
+  if (netLoss >= 1) return { isSacrifice: true, type: "pawn", netLoss };
   return { isSacrifice: false, type: null, netLoss: 0 };
 }
 
@@ -406,17 +466,51 @@ function buildMoveAnalysis(
     isWhiteMove,
   );
 
-  if (
-    grade === "best" &&
-    isBrilliantMove(
-      cpLoss,
-      evalAfter.cp,
-      pvLinesAfterWhite,
-      sacrifice.isSacrifice,
-    )
-  ) {
+  // FIX: jangan gate ke grade === "best" — sacrifice/only-move bisa punya
+  // cpLoss yang ke-classify "excellent"/"good" duluan (krn cpLoss sacrifice
+  // gak selalu <15), sehingga brilliant/great gak pernah ke-cek sama sekali.
+  // isBrilliantMove & isGreatMove sudah punya cpLoss check sendiri di dalam,
+  // jadi cek independen dari classifyMove, baru override grade-nya.
+  const brilliantSacrificeCheck = isBrilliantMove(
+    cpLoss,
+    evalAfter.cp,
+    pvLinesAfterWhite,
+    sacrifice.isSacrifice,
+  );
+  // Jalur tambahan: forcing check + king lawan dipaksa keluar + only-good-move
+  // (PV diambil dari evalBefore — milik pemain aktif sendiri, bukan PV lawan).
+  const brilliantKingHuntCheck = isKingHuntBrilliant(
+    raw.san,
+    cpLoss,
+    cpWhiteBefore,
+    pvLinesBeforeWhite,
+    raw.fenBefore,
+    raw.fenAfter,
+  );
+  const brilliantCheck = brilliantSacrificeCheck || brilliantKingHuntCheck;
+  const greatCheck = isGreatMove(cpLoss, pvLinesBeforeWhite);
+
+  log.info(
+    "buildMoveAnalysis",
+    `${raw.san} (idx=${raw.moveIdx}, color=${raw.color}):`,
+    `cpLoss=${cpLoss}`,
+    `cpBefore=${cpBefore}`,
+    `cpAfter=${cpAfter}`,
+    `evalAfter.cp(white)=${evalAfter.cp}`,
+    `isSacrifice=${sacrifice.isSacrifice}`,
+    `sacrificeType=${sacrifice.type}`,
+    `netLoss=${sacrifice.netLoss}`,
+    `pvAfterWhite=${JSON.stringify(pvLinesAfterWhite.slice(0, 2).map((p) => p?.cp))}`,
+    `pvBeforeWhite=${JSON.stringify(pvLinesBeforeWhite.slice(0, 2).map((p) => p?.cp))}`,
+    `brilliantSacrificeCheck=${brilliantSacrificeCheck}`,
+    `brilliantKingHuntCheck=${brilliantKingHuntCheck}`,
+    `greatCheck=${greatCheck}`,
+    `classifyMoveGrade=${grade}`,
+  );
+
+  if (brilliantCheck) {
     grade = "brilliant";
-  } else if (grade === "best" && isGreatMove(cpLoss, pvLinesBeforeWhite)) {
+  } else if (greatCheck) {
     grade = "great";
   }
 
