@@ -683,7 +683,7 @@ const EMPTY_EVAL: LiveEval = {
 
 import { FaGithub } from "react-icons/fa";
 
-const GITHUB_URL = "https://github.com/your-username/forensic-chess";
+const GITHUB_URL = "https://github.com/userrrrnn77/forensic-chess";
 
 function Navbar() {
   return (
