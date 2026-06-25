@@ -1,0 +1,65 @@
+/* Import Font Premium dari Google Fonts */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+/* Panggil Tailwind v4 */
+@import "tailwindcss";
+
+/* 
+  SETUP THEME TAILWIND V4 
+  Di v4, kita gausah repot bikin tailwind.config.js buat nambahin warna/font custom.
+  Semua variabel di dalam blok @theme otomatis jadi utility class Tailwind!
+*/
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg-base: #161512;
+  --color-bg-panel: #262522;
+  --color-bg-surface: #302e2b;
+  --color-bg-hover: #3d3b36;
+
+  --color-text-main: #ffffff;
+  --color-text-muted: #bababa;
+  --color-text-subtle: #73726f;
+
+  --color-brand-green: #81b64c;
+  --color-brand-green-hover: #a3d160;
+
+  --color-grade-brilliant: #1baca6;
+  --color-grade-great: #5c8bb0;
+  --color-grade-best: #81b64c;
+  --color-grade-good: #96af8b;
+  --color-grade-inaccuracy: #f0c15c;
+  --color-grade-mistake: #e6912c;
+  --color-grade-blunder: #b33430;
+  --color-grade-miss: #ff7769;
+}
+
+/* 
+  BASE LAYER
+  Kita atur default styling body biar langsung auto dark mode dan cakep 
+*/
+@layer base {
+  body {
+    @apply bg-bg-base text-text-main font-sans antialiased;
+    /* Custom Scrollbar biar senada sama tema dark */
+    scrollbar-color: var(--color-bg-hover) var(--color-bg-base);
+    scrollbar-width: thin;
+  }
+
+  /* Styling scrollbar webkit (Chrome, Edge, Safari) */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-bg-base);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-bg-hover);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-text-subtle);
+  }
+}

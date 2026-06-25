@@ -1,0 +1,15 @@
+{
+  "name": "reckless",
+  "type": "module",
+  "version": "0.10.0-dev",
+  "files": [
+    "reckless_bg.wasm",
+    "reckless.js",
+    "reckless.d.ts"
+  ],
+  "main": "reckless.js",
+  "types": "reckless.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

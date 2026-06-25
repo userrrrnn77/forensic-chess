@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <link rel="icon" type="image/png" href="/forensic_chess.png" />
+    <link rel="apple-touch-icon" href="/forensic_chess.png" />
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="author" content="Rendy (Bre)" />
+    <meta name="theme-color" content="#050505" />
+
+    <title>Forensic Chess — In-Browser Chess Game Analyzer</title>
+    <meta
+      name="description"
+      content="Analyze your chess games directly in the browser with a custom WASM engine. Get move-by-move grading (brilliant, blunder, mistake), accuracy, opening detection, and critical moments — 100% client-side, no upload needed."
+    />
+    <meta
+      name="keywords"
+      content="chess analysis, chess engine, chess game analyzer, chess accuracy, blunder detection, chess opening detection, WASM chess engine, forensic chess"
+    />
+    <link rel="canonical" href="https://forensic-chess.app/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Forensic Chess" />
+    <meta property="og:title" content="Forensic Chess — In-Browser Chess Game Analyzer" />
+    <meta
+      property="og:description"
+      content="Analyze your chess games directly in the browser with a custom WASM engine. Move grading, accuracy, opening detection, and critical moments — 100% client-side."
+    />
+    <meta property="og:image" content="https://forensic-chess.app/forensic_chess.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:url" content="https://forensic-chess.app/" />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Forensic Chess — In-Browser Chess Game Analyzer" />
+    <meta
+      name="twitter:description"
+      content="Analyze your chess games directly in the browser with a custom WASM engine. Move grading, accuracy, opening detection, and critical moments."
+    />
+    <meta name="twitter:image" content="https://forensic-chess.app/forensic_chess.png" />
+
+    <meta name="robots" content="index, follow" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Forensic Chess",
+        "applicationCategory": "GameApplication",
+        "operatingSystem": "Any (Web Browser)",
+        "description": "In-browser chess game analyzer powered by a custom WASM engine — move grading, accuracy, and opening detection.",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "author": {
+          "@type": "Person",
+          "name": "Rendy"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

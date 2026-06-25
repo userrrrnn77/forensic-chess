@@ -1,0 +1,821 @@
+// src/engine/chessAnalyzer.ts
+//
+// Orchestrator utama analisis game catur.
+//
+// Flow:
+//   1. Parse PGN → extract moves + FEN sequence via chess.js
+//   2. Eval tiap posisi (FEN sebelum + sesudah langkah) via reckless worker
+//   3. Normalisasi cp ke perspektif pemain aktif (hitam = flip sign)
+//   4. Hitung cpLoss → grade via classifyMove / isBrilliantMove / isGreatMove
+//   5. Aggregate accuracy per warna, move distribution, dll
+//
+// PENTING — Konvensi cp:
+//   • Engine selalu return cp dari perspektif PUTIH (positif = putih unggul).
+//   • Sebelum hitung cpLoss kita konversi ke perspektif PEMAIN AKTIF:
+//       cpForActive = isWhite ? cpWhite : -cpWhite
+//   • cpLoss = cpForActive(before) - cpForActive(after)
+//     Nilai positif berarti langkah memperburuk posisi pemain aktif.
+
+import { Chess } from "chess.js";
+import type { MoveAnalysis, AnalysisData, PVLine, MoveGrade } from "../types";
+import {
+  classifyMove,
+  isBrilliantMove,
+  isGreatMove,
+  detectOpening,
+  detectPhase,
+  evaluatePawnStructure,
+  evaluateKingSafety,
+  evaluatePieceActivity,
+  countMaterialFromFen,
+  detectTacticalThemes,
+  generateExplanation,
+  getAdaptiveMovetime,
+  BATCH_MULTI_PV,
+  PARALLEL_WORKERS,
+  TB_PIECE_THRESHOLD,
+  _singleton,
+  initSingleton,
+  splitIntoChunks,
+  workerNewGame,
+  initBatchWorker,
+  queryTablebase,
+  calcAccuracy,
+} from "../utils/moduleChess";
+import { log } from "../utils/logger";
+
+// ── Konstanta lokal ───────────────────────────────────────────────────────────
+
+/** cp cap untuk posisi yang sudah winning/losing ekstrem (hindari noise) */
+const CP_CAP = 1500;
+
+/** Kalau engine return mate, map ke cp ini (dari perspektif yang diuntungkan) */
+const MATE_CP = 10000;
+
+/** Timeout per posisi (ms) sebelum eval dianggap gagal */
+const EVAL_TIMEOUT_MS = 12000;
+
+// ── Types lokal ───────────────────────────────────────────────────────────────
+
+interface PositionEval {
+  fen: string;
+  cp: number; // perspektif PUTIH, sudah di-cap
+  pvLines: PVLine[];
+  depth: number;
+  fromTablebase: boolean;
+}
+
+interface RawMove {
+  san: string;
+  uci: string;
+  fenBefore: string;
+  fenAfter: string;
+  color: "white" | "black";
+  moveIdx: number; // 0-based index di array moves
+}
+
+/**
+ * Reasons mengapa sebuah langkah dapat grade tertentu.
+ * Dipakai untuk UI "mengapa brilliant/great/dll".
+ */
+export interface MoveReasons {
+  // Brilliant-specific
+  isSacrifice: boolean; // pemain melepas material tapi posisi tetap bagus
+  sacrificeType: "piece" | "exchange" | "pawn" | null;
+  isOnlyGoodMove: boolean; // satu-satunya move yang mempertahankan advantage
+  pvGapCp: number; // selisih cp antara PV1 dan PV2 (perspektif putih)
+
+  // Great-specific
+  isDefensiveGem: boolean; // move yang menyelamatkan posisi yang hampir kalah
+  isCounterAttack: boolean; // balik menyerang saat lawan unggul
+
+  // Konteks umum
+  isForcing: boolean; // check, capture, atau ancaman mate langsung
+  positionComplexity: "low" | "medium" | "high"; // seberapa complicated posisi
+  labels: string[]; // label human-readable untuk UI
+}
+
+// ── Parser PGN ────────────────────────────────────────────────────────────────
+
+/**
+ * Parse PGN → array RawMove dengan FEN sebelum dan sesudah tiap langkah.
+ * Throws kalau PGN invalid.
+ */
+export function parsePgn(pgn: string): RawMove[] {
+  const chess = new Chess();
+
+  // chess.js v1.x: loadPgn throws kalau invalid
+  try {
+    chess.loadPgn(pgn.trim());
+  } catch (err) {
+    throw new Error(`PGN invalid: ${err}`);
+  }
+
+  const history = chess.history({ verbose: true });
+  if (history.length === 0) throw new Error("PGN tidak mengandung langkah");
+
+  // Replay dari awal buat dapet FEN sequence
+  chess.reset();
+  const rawMoves: RawMove[] = [];
+
+  for (let i = 0; i < history.length; i++) {
+    const mv = history[i];
+    const fenBefore = chess.fen();
+    chess.move(mv.san);
+    const fenAfter = chess.fen();
+
+    rawMoves.push({
+      san: mv.san,
+      uci: mv.from + mv.to + (mv.promotion ?? ""),
+      fenBefore,
+      fenAfter,
+      color: mv.color === "w" ? "white" : "black",
+      moveIdx: i,
+    });
+  }
+
+  return rawMoves;
+}
+
+// ── Eval satu posisi via worker ───────────────────────────────────────────────
+
+/**
+ * Kirim satu posisi ke worker, tunggu bestmove + info lines.
+ * Return PositionEval (perspektif PUTIH).
+ *
+ * Strategi:
+ *   - Kalau piece count ≤ TB_PIECE_THRESHOLD → coba tablebase dulu
+ *   - Sinon → go movetime adaptif dengan multiPV
+ */
+async function evalPosition(
+  worker: Worker,
+  fen: string,
+  moveIdx: number,
+): Promise<PositionEval> {
+  // ── Coba tablebase ────────────────────────────────────────────────────────
+  const { pieceCount } = countMaterialFromFen(fen);
+  if (pieceCount <= TB_PIECE_THRESHOLD) {
+    const tb = await queryTablebase(fen);
+    if (tb.category !== null) {
+      // Map kategori tablebase ke cp kasar
+      let tbCp = 0;
+      if (tb.category === "win") tbCp = MATE_CP;
+      else if (tb.category === "loss") tbCp = -MATE_CP;
+      else tbCp = 0; // draw
+
+      // Cek apakah giliran hitam (cp harus dari perspektif putih)
+      const isBlackToMove = fen.includes(" b ");
+      const cpWhite = isBlackToMove ? -tbCp : tbCp;
+
+      return {
+        fen,
+        cp: Math.max(-CP_CAP, Math.min(CP_CAP, cpWhite)),
+        pvLines: tb.bestMove
+          ? [{ depth: 99, cp: cpWhite, mate: null, moves: [tb.bestMove] }]
+          : [],
+        depth: 99,
+        fromTablebase: true,
+      };
+    }
+  }
+
+  // ── Eval via worker ───────────────────────────────────────────────────────
+  const movetime = getAdaptiveMovetime(fen, moveIdx);
+
+  return new Promise<PositionEval>((resolve) => {
+    const pvMap = new Map<number, PVLine>(); // multipv index → PVLine terbaik
+    let latestDepth = 0;
+    let settled = false;
+
+    const settle = (fallbackCp = 0) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(tid);
+      worker.removeEventListener("message", handler);
+
+      const pvLines = Array.from(pvMap.entries())
+        .sort((a, b) => a[0] - b[0]) // sort by multipv index, ascending
+        .map(([, pv]) => pv);
+
+      // Ambil cp dari PV #1 (multipv=1 = best line)
+      const bestPv = pvMap.get(1);
+      let cp = bestPv?.cp ?? fallbackCp;
+
+      // Handle mate score
+      if (bestPv?.mate != null) {
+        cp = bestPv.mate > 0 ? MATE_CP : -MATE_CP;
+      }
+
+      const isBlackToMove = fen.includes(" b ");
+      if (isBlackToMove) cp = -cp;
+
+      const normalizedPvLines = pvLines.map((pv) => ({
+        ...pv,
+        cp: pv.cp != null ? (isBlackToMove ? -pv.cp : pv.cp) : null,
+      }));
+
+      resolve({
+        fen,
+        cp: Math.max(-CP_CAP, Math.min(CP_CAP, cp)),
+        pvLines: normalizedPvLines,
+        depth: latestDepth,
+        fromTablebase: false,
+      });
+    };
+
+    const handler = (e: MessageEvent) => {
+      if (settled || typeof e.data !== "string") return;
+      const msg = e.data.trim();
+
+      if (msg.startsWith("info depth")) {
+        // Parse info line
+        const depthM = msg.match(/\bdepth (\d+)/);
+        const mpvM = msg.match(/\bmultipv (\d+)/);
+        const cpM = msg.match(/\bscore cp (-?\d+)/);
+        const mateM = msg.match(/\bscore mate (-?\d+)/);
+        const pvM = msg.match(/\bpv (.+)$/);
+
+        if (!depthM) return;
+        const depth = parseInt(depthM[1], 10);
+        const mpv = mpvM ? parseInt(mpvM[1], 10) : 1;
+        const cp = cpM ? parseInt(cpM[1], 10) : null;
+        const mate = mateM ? parseInt(mateM[1], 10) : null;
+        const moves = pvM ? pvM[1].trim().split(/\s+/) : [];
+
+        latestDepth = Math.max(latestDepth, depth);
+
+        // Simpan PV terdalam per multipv index
+        const existing = pvMap.get(mpv);
+        if (!existing || depth >= existing.depth) {
+          pvMap.set(mpv, { depth, cp, mate, moves });
+        }
+        return;
+      }
+
+      if (msg.startsWith("bestmove")) {
+        settle();
+      }
+    };
+
+    const tid = setTimeout(() => {
+      log.warn("evalPosition", `timeout fen=${fen.slice(0, 20)}...`);
+      settle();
+    }, EVAL_TIMEOUT_MS);
+
+    worker.addEventListener("message", handler);
+    worker.postMessage(`position fen ${fen}`);
+    worker.postMessage(`go movetime ${movetime} multipv ${BATCH_MULTI_PV}`);
+  });
+}
+
+// ── Normalisasi cp ────────────────────────────────────────────────────────────
+
+/**
+ * Konversi cp perspektif PUTIH → perspektif PEMAIN AKTIF.
+ * FEN mengandung " w " atau " b " buat cek giliran.
+ */
+// function cpForActivePlayer(cpWhite: number, fen: string): number {
+//   const isBlack = fen.includes(" b ");
+//   return isBlack ? -cpWhite : cpWhite;
+// }
+
+// ── Cap & clamp helpers ───────────────────────────────────────────────────────
+
+function clampCp(cp: number): number {
+  return Math.max(-CP_CAP, Math.min(CP_CAP, cp));
+}
+
+/**
+ * Deteksi apakah langkah ini adalah sacrifice material yang sesungguhnya.
+ *
+ * PENTING: sacrifice TIDAK bisa dideteksi dari fenBefore vs fenAfter satu ply,
+ * karena piece yang "disacrifice" masih ada tepat sesudah langkah dimainkan —
+ * itu baru hilang beberapa langkah kemudian sebagai konsekuensi (misal Bxh7
+ * lalu beberapa ply kemudian bishop itu ditangkap balik). Jadi kita proyeksikan
+ * sepanjang PV (predicted continuation) milik EVAL SESUDAH langkah ini,
+ * bukan cuma fenAfter sesaat.
+ *
+ * FIX BUG #1 (sacrifice direction):
+ * PV yang kita pakai berasal dari evalAfter — yaitu hasil search engine pada
+ * posisi SESUDAH langkah dimainkan, di mana giliran sudah berpindah ke lawan.
+ * Artinya ply pertama dari PV itu adalah balasan LAWAN, bukan lanjutan pemain
+ * aktif. Replay PV ini harus dimulai dari fenAfterMove (giliran lawan), BUKAN
+ * dari fenBeforeMove (giliran pemain aktif) — kalau dimulai dari fenBeforeMove,
+ * uci move pertama di PV nggak valid di posisi itu (turn mismatch), chess.js
+ * throw, proyeksi berhenti di ply 0, dan sacrifice nggak pernah terdeteksi
+ * dengan benar.
+ *
+ * Pendekatan yang benar: mulai proyeksi dari fenAfterMove (posisi nyata
+ * setelah langkah dimainkan), lalu apply PV continuation dari situ. Material
+ * dihitung relatif terhadap material SEBELUM langkah (fenBeforeMove) supaya
+ * langkah itu sendiri (mis. capture) ikut terhitung dalam delta.
+ */
+function detectSacrifice(
+  fenBeforeMove: string,
+  fenAfterMove: string, // FIX: posisi nyata setelah langkah ini dimainkan
+  pvContinuationUci: string[], // PV dari evalAfter (posisi setelah langkah ini)
+  isWhite: boolean,
+  projectionPlies: number = 6, // proyeksi ~3 langkah penuh ke depan
+): {
+  isSacrifice: boolean;
+  type: "piece" | "exchange" | "pawn" | null;
+  netLoss: number;
+} {
+  const before = countMaterialFromFen(fenBeforeMove);
+  const ownBefore = isWhite ? before.white : before.black;
+  const oppBefore = isWhite ? before.black : before.white;
+
+  // FIX: simulasi mulai dari fenAfterMove (giliran lawan), karena PV dari
+  // evalAfter dihasilkan dari posisi itu — ply pertama PV adalah balasan lawan.
+  const chess = new Chess(fenAfterMove);
+  let plies = 0;
+  for (const uciMove of pvContinuationUci) {
+    if (plies >= projectionPlies) break;
+    const from = uciMove.slice(0, 2);
+    const to = uciMove.slice(2, 4);
+    const promotion = uciMove.length > 4 ? uciMove.slice(4) : undefined;
+    try {
+      chess.move({ from, to, promotion });
+    } catch {
+      break; // PV move invalid di posisi simulasi, stop proyeksi di sini
+    }
+    plies++;
+  }
+
+  const projected = countMaterialFromFen(chess.fen());
+  const ownProjected = isWhite ? projected.white : projected.black;
+  const oppProjected = isWhite ? projected.black : projected.white;
+
+  const ownDelta = ownBefore - ownProjected; // > 0 = pemain aktif net rugi piece
+  const oppDelta = oppBefore - oppProjected; // > 0 = lawan net rugi piece
+  const netLoss = ownDelta - oppDelta;
+
+  if (netLoss >= 3) return { isSacrifice: true, type: "piece", netLoss };
+  if (netLoss === 2) return { isSacrifice: true, type: "exchange", netLoss };
+  if (netLoss === 1) return { isSacrifice: true, type: "pawn", netLoss };
+  return { isSacrifice: false, type: null, netLoss: 0 };
+}
+
+// ── Build MoveAnalysis dari dua eval ─────────────────────────────────────────
+
+function buildMoveAnalysis(
+  raw: RawMove,
+  evalBefore: PositionEval,
+  evalAfter: PositionEval,
+): MoveAnalysis {
+  // cp dari perspektif pemain yang BERGERAK di langkah ini
+  // fenBefore = posisi sebelum langkah → pemain aktif = yang bergerak
+  // cp dari perspektif PUTIH (engine convention)
+  const cpWhiteBefore = evalBefore.cp;
+  const cpWhiteAfter = evalAfter.cp;
+
+  // Konversi ke perspektif pemain yang bergerak di langkah ini
+  // Pemain yang bergerak = active player di fenBefore
+  const isBlackMove = raw.fenBefore.includes(" b ");
+  const sign = isBlackMove ? -1 : 1;
+  // fenAfter = posisi setelah langkah → giliran ganti, jadi flip lagi
+  // cpAfter harus dari perspektif pemain yang BARU SAJA bergerak:
+  //   evalAfter.cp = perspektif putih → konversi ke perspektif pemain yang bergerak
+  //   = cpForActivePlayer(evalAfter.cp, fenBefore) karena pemain yang bergerak
+  //     sama dengan yang aktif di fenBefore
+  // Konversi: perspektif putih → perspektif pemain yang baru bergerak
+
+  const cpBefore = clampCp(sign * cpWhiteBefore);
+  const cpAfter = clampCp(sign * cpWhiteAfter);
+
+  const cpLoss = Math.max(0, cpBefore - cpAfter);
+
+  // PV lines dari perspektif PUTIH (untuk isBrilliantMove / isGreatMove)
+  // yang butuh cp dari perspektif putih untuk konsistensi perbandingan
+  const pvLinesBeforeWhite: PVLine[] = evalBefore.pvLines;
+  const pvLinesAfterWhite: PVLine[] = evalAfter.pvLines;
+
+  // Grade awal
+  let grade: MoveGrade = classifyMove(
+    cpLoss,
+    pvLinesBeforeWhite,
+    raw.fenBefore,
+  );
+
+  const isWhiteMove = raw.color === "white";
+  const pvContinuation = evalAfter.pvLines[0]?.moves ?? [];
+  const sacrifice = detectSacrifice(
+    raw.fenBefore,
+    raw.fenAfter,
+    pvContinuation,
+    isWhiteMove,
+  );
+
+  if (
+    grade === "best" &&
+    isBrilliantMove(
+      cpLoss,
+      evalAfter.cp,
+      pvLinesAfterWhite,
+      sacrifice.isSacrifice,
+    )
+  ) {
+    grade = "brilliant";
+  } else if (grade === "best" && isGreatMove(cpLoss, pvLinesBeforeWhite)) {
+    grade = "great";
+  }
+
+  // Metadata posisi
+  const phase = detectPhase(raw.fenBefore);
+  const pawnScore = evaluatePawnStructure(raw.fenBefore);
+  const kingScore = evaluateKingSafety(raw.fenBefore);
+  const pieceScore = evaluatePieceActivity(raw.fenBefore);
+  const { balance: materialBalance } = countMaterialFromFen(raw.fenBefore);
+  const tacticalThemes = detectTacticalThemes(cpLoss, cpBefore, cpAfter);
+  const isTactical = tacticalThemes.length > 0;
+  const explanation = generateExplanation(
+    grade,
+    cpLoss,
+    phase,
+    tacticalThemes,
+    pawnScore,
+    kingScore,
+    pieceScore,
+    sacrifice.type,
+  );
+
+  // Best move suggestion = move #1 dari PV evalBefore (engine's top choice)
+  const bestMoveSuggestion = evalBefore.pvLines[0]?.moves[0] ?? null;
+
+  return {
+    moveIdx: raw.moveIdx,
+    move: raw.san,
+    fen: raw.fenBefore,
+    cpBefore,
+    cpAfter,
+    cpLoss,
+    grade,
+    isBrilliant: grade === "brilliant",
+    isGreat: grade === "great",
+    isBest: grade === "best" || grade === "brilliant" || grade === "great",
+    bestMoveSuggestion,
+    phase,
+    materialBalance,
+    pawnStructureScore: pawnScore,
+    kingSafetyScore: kingScore,
+    pieceActivityScore: pieceScore,
+    isTactical,
+    tacticalTheme: tacticalThemes,
+    explanation,
+  };
+}
+
+function buildDistribution(
+  analyses: MoveAnalysis[],
+  color: "white" | "black",
+): Record<string, number> {
+  const dist: Record<string, number> = {};
+  for (const m of analyses) {
+    const isWhite = m.moveIdx % 2 === 0;
+    if (color === "white" ? !isWhite : isWhite) continue;
+    dist[m.grade] = (dist[m.grade] ?? 0) + 1;
+  }
+  return dist;
+}
+
+// ── Critical moments detector ─────────────────────────────────────────────────
+
+/**
+ * Deteksi indeks langkah di mana terjadi swing eval besar (±150cp atau lebih).
+ */
+function findCriticalMoments(analyses: MoveAnalysis[]): number[] {
+  return analyses
+    .filter((m) => m.cpLoss >= 150 || m.isTactical)
+    .map((m) => m.moveIdx);
+}
+
+// ── Best accuracy streak ──────────────────────────────────────────────────────
+
+function findBestAccuracyStreak(analyses: MoveAnalysis[]): {
+  color: "white" | "black";
+  length: number;
+  from: number;
+} {
+  let best = { color: "white" as "white" | "black", length: 0, from: 0 };
+
+  for (const color of ["white", "black"] as const) {
+    const moves = analyses.filter((m) =>
+      color === "white" ? m.moveIdx % 2 === 0 : m.moveIdx % 2 !== 0,
+    );
+    let streak = 0;
+    let streakStart = 0;
+    for (let i = 0; i < moves.length; i++) {
+      const g = moves[i].grade;
+      if (
+        g === "brilliant" ||
+        g === "great" ||
+        g === "best" ||
+        g === "excellent"
+      ) {
+        if (streak === 0) streakStart = moves[i].moveIdx;
+        streak++;
+        if (streak > best.length) {
+          best = { color, length: streak, from: streakStart };
+        }
+      } else {
+        streak = 0;
+      }
+    }
+  }
+  return best;
+}
+
+// ── Eval semua posisi (parallel batch) ───────────────────────────────────────
+
+/**
+ * Eval semua FEN unik yang dibutuhkan.
+ * Tiap game butuh eval N+1 posisi (sebelum langkah 1 sampai setelah langkah N).
+ * Distribusikan ke PARALLEL_WORKERS batch workers.
+ */
+async function evalAllPositions(
+  fens: string[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<Map<string, PositionEval>> {
+  const result = new Map<string, PositionEval>();
+
+  // De-dup
+  const uniqueFens = [...new Set(fens)];
+  const total = uniqueFens.length;
+  let done = 0;
+
+  // Dapatkan batch workers (init kalau belum ada)
+  let workers: Worker[];
+  if (_singleton.batchWorkersPromise) {
+    workers = await _singleton.batchWorkersPromise;
+  } else {
+    workers = await Promise.all(
+      Array.from({ length: PARALLEL_WORKERS }, () => initBatchWorker()),
+    );
+  }
+
+  if (workers.length === 0) throw new Error("Tidak ada batch worker tersedia");
+
+  // Reset semua worker
+  await Promise.all(workers.map((w) => workerNewGame(w)));
+
+  // Split FEN ke chunks
+  const chunks = splitIntoChunks(uniqueFens, workers.length);
+
+  await Promise.all(
+    chunks.map(async ({ items, startIdx }, chunkIndex) => {
+      // FIX BUG #3 (worker assignment):
+      // Sebelumnya: workers[startIdx % workers.length]
+      // startIdx = chunkIndex * size, di mana size = ceil(uniqueFens.length / workers.length).
+      // startIdx % workers.length CUMA sama dengan chunkIndex kalau size kebetulan
+      // kelipatan rapi dari workers.length. Kalau nggak, beberapa chunk bisa
+      // ke-mapping ke worker yang sama sementara worker lain nganggur — eval
+      // jadi nggak benar-benar paralel, DAN dua chunk yang kebagian worker
+      // sama akan saling rebutan event listener "message" milik worker itu
+      // di evalPosition (race condition: hasil posisi A bisa nge-resolve
+      // promise milik posisi B kalau listener-nya nimpa).
+      //
+      // Fix: pakai index chunk itu sendiri untuk pilih worker — setiap chunk
+      // sudah unik dan jumlahnya <= workers.length (lihat splitIntoChunks),
+      // jadi modulo di sini cuma jaga-jaga, bukan sumber bug lagi.
+      const worker = workers[chunkIndex % workers.length];
+
+      for (let i = 0; i < items.length; i++) {
+        const fen = items[i];
+        // Cek cache
+        const cached = _singleton.evalCache.get(fen);
+        if (cached) {
+          result.set(fen, {
+            fen,
+            cp: cached.cp,
+            pvLines: cached.pvLines,
+            // FIX BUG #2 (cache depth/fromTablebase):
+            // Sebelumnya selalu depth:0, fromTablebase:false untuk cache hit,
+            // padahal eval cache itu valid dan bisa saja berasal dari
+            // tablebase (depth 99) atau search dalam (depth tinggi). Kalau
+            // konsumen MoveAnalysis nanti pakai depth/fromTablebase untuk
+            // filter kualitas data, cache hit selalu kelihatan "dangkal"
+            // walau sebenarnya datanya bagus.
+            // EvalResult cache tidak menyimpan depth/fromTablebase secara
+            // eksplisit, jadi kita infer dari pvLines: tablebase selalu
+            // menyimpan depth 99 di line pertamanya.
+            depth: cached.pvLines[0]?.depth ?? 0,
+            fromTablebase: cached.pvLines[0]?.depth === 99,
+          });
+          done++;
+          onProgress?.(done, total);
+          continue;
+        }
+
+        try {
+          const ev = await evalPosition(worker, fen, startIdx + i);
+          result.set(fen, ev);
+          // Simpan ke cache
+          _singleton.evalCache.set(fen, {
+            cp: ev.cp,
+            pvLines: ev.pvLines,
+          });
+        } catch (err) {
+          log.warn(
+            "evalAllPositions",
+            `eval gagal untuk fen=${fen.slice(0, 20)}`,
+            err,
+          );
+          // Fallback: eval 0
+          result.set(fen, {
+            fen,
+            cp: 0,
+            pvLines: [],
+            depth: 0,
+            fromTablebase: false,
+          });
+        }
+
+        done++;
+        onProgress?.(done, total);
+      }
+    }),
+  );
+
+  return result;
+}
+
+// ── Game phase distribution ───────────────────────────────────────────────────
+
+function calcGamePhases(analyses: MoveAnalysis[]): {
+  opening: number;
+  middlegame: number;
+  endgame: number;
+} {
+  const counts = { opening: 0, middlegame: 0, endgame: 0 };
+  for (const m of analyses) counts[m.phase]++;
+  const total = analyses.length || 1;
+  return {
+    opening: Math.round((counts.opening / total) * 100),
+    middlegame: Math.round((counts.middlegame / total) * 100),
+    endgame: Math.round((counts.endgame / total) * 100),
+  };
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export interface AnalyzeOptions {
+  /** Dipanggil saat progress eval berubah (0–1) */
+  onProgress?: (progress: number) => void;
+  /** Override depth (default TARGET_DEPTH dari moduleChess) */
+  depth?: number;
+}
+
+/**
+ * Analisis satu game dari PGN.
+ * Return AnalysisData lengkap.
+ *
+ * Cara pakai:
+ *   const result = await analyzeGame(pgn, { onProgress: (p) => setProgress(p) });
+ */
+export async function analyzeGame(
+  pgn: string,
+  options: AnalyzeOptions = {},
+): Promise<AnalysisData> {
+  const { onProgress } = options;
+
+  // 1. Parse PGN
+  const rawMoves = parsePgn(pgn);
+  if (rawMoves.length === 0) throw new Error("Game tidak mengandung langkah");
+
+  // 2. Kumpulkan semua FEN yang perlu di-eval
+  //    = fenBefore tiap langkah + fenAfter langkah terakhir
+  const allFens: string[] = [];
+  for (const m of rawMoves) {
+    allFens.push(m.fenBefore);
+  }
+  // Tambah fenAfter langkah terakhir
+  allFens.push(rawMoves[rawMoves.length - 1].fenAfter);
+
+  // 3. Pastikan singleton/worker ready
+  await new Promise<void>((resolve) => {
+    initSingleton(() => resolve());
+    // Kalau sudah ready, initSingleton langsung panggil callback
+  });
+
+  // 4. Eval semua posisi
+  const evalMap = await evalAllPositions(allFens, (done, total) => {
+    onProgress?.(done / total);
+  });
+
+  // 5. Build MoveAnalysis per langkah
+  const moveAnalyses: MoveAnalysis[] = [];
+
+  for (const raw of rawMoves) {
+    const evBefore = evalMap.get(raw.fenBefore);
+    const evAfter = evalMap.get(raw.fenAfter);
+
+    if (!evBefore || !evAfter) {
+      log.warn(
+        "analyzeGame",
+        `eval missing untuk move ${raw.moveIdx} (${raw.san})`,
+      );
+      continue;
+    }
+
+    moveAnalyses.push(buildMoveAnalysis(raw, evBefore, evAfter));
+  }
+
+  // 6. Opening detection — pakai SAN sequence
+  const sanMoves = rawMoves.map((m) => m.san);
+  const { name: openingName, eco: openingEco } = detectOpening(sanMoves);
+
+  // 7. Accuracy
+  const whiteAccuracy = calcAccuracy(moveAnalyses, "white");
+  const blackAccuracy = calcAccuracy(moveAnalyses, "black");
+  const overallAccuracy =
+    Math.round(((whiteAccuracy + blackAccuracy) / 2) * 10) / 10;
+
+  // 8. Move distribution per warna
+  const whiteDist = buildDistribution(moveAnalyses, "white");
+  const blackDist = buildDistribution(moveAnalyses, "black");
+
+  // 9. Metadata tambahan
+  const criticalMoments = findCriticalMoments(moveAnalyses);
+  const bestAccuracyStreak = findBestAccuracyStreak(moveAnalyses);
+  const gamePhases = calcGamePhases(moveAnalyses);
+
+  onProgress?.(1);
+
+  return {
+    accuracy: overallAccuracy,
+    accuracyByColor: { white: whiteAccuracy, black: blackAccuracy },
+    moveDistribution: { white: whiteDist, black: blackDist },
+    moveAnalyses,
+    openingName,
+    openingEco,
+    gamePhases,
+    criticalMoments,
+    bestAccuracyStreak,
+  };
+}
+
+/**
+ * Versi streaming — callback dipanggil setiap langkah selesai di-analisis.
+ * Berguna buat update UI secara incremental.
+ */
+export async function analyzeGameStreaming(
+  pgn: string,
+  onMove: (analysis: MoveAnalysis, idx: number, total: number) => void,
+  options: AnalyzeOptions = {},
+): Promise<AnalysisData> {
+  const { onProgress } = options;
+  const rawMoves = parsePgn(pgn);
+
+  await new Promise<void>((resolve) => {
+    initSingleton(() => resolve());
+  });
+
+  const allFens: string[] = rawMoves.map((m) => m.fenBefore);
+  allFens.push(rawMoves[rawMoves.length - 1].fenAfter);
+
+  const evalMap = await evalAllPositions(allFens, (done, total) => {
+    // Progress eval = 80% dari total progress
+    onProgress?.((done / total) * 0.8);
+  });
+
+  const moveAnalyses: MoveAnalysis[] = [];
+  const total = rawMoves.length;
+
+  for (let i = 0; i < rawMoves.length; i++) {
+    const raw = rawMoves[i];
+    const evBefore = evalMap.get(raw.fenBefore);
+    const evAfter = evalMap.get(raw.fenAfter);
+
+    if (!evBefore || !evAfter) continue;
+
+    const analysis = buildMoveAnalysis(raw, evBefore, evAfter);
+    moveAnalyses.push(analysis);
+    onMove(analysis, i, total);
+
+    // Progress build = 80-100%
+    onProgress?.(0.8 + (i / total) * 0.2);
+  }
+
+  const sanMoves = rawMoves.map((m) => m.san);
+  const { name: openingName, eco: openingEco } = detectOpening(sanMoves);
+
+  const whiteAccuracy = calcAccuracy(moveAnalyses, "white");
+  const blackAccuracy = calcAccuracy(moveAnalyses, "black");
+
+  onProgress?.(1);
+
+  return {
+    accuracy: Math.round(((whiteAccuracy + blackAccuracy) / 2) * 10) / 10,
+    accuracyByColor: { white: whiteAccuracy, black: blackAccuracy },
+    moveDistribution: {
+      white: buildDistribution(moveAnalyses, "white"),
+      black: buildDistribution(moveAnalyses, "black"),
+    },
+    moveAnalyses,
+    openingName,
+    openingEco,
+    gamePhases: calcGamePhases(moveAnalyses),
+    criticalMoments: findCriticalMoments(moveAnalyses),
+    bestAccuracyStreak: findBestAccuracyStreak(moveAnalyses),
+  };
+}
