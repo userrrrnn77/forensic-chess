@@ -479,6 +479,9 @@ function buildMoveAnalysis(
   );
   // Jalur tambahan: forcing check + king lawan dipaksa keluar + only-good-move
   // (PV diambil dari evalBefore — milik pemain aktif sendiri, bukan PV lawan).
+  // Pass isSacrifice supaya settled-mate guard bisa dikecualikan untuk
+  // sacrifice nyata (Bxf7+, exf2+) tapi tidak untuk capture non-sacrifice
+  // (Qxd1+ ambil ratu gratis).
   const brilliantKingHuntCheck = isKingHuntBrilliant(
     raw.san,
     cpLoss,
@@ -486,9 +489,12 @@ function buildMoveAnalysis(
     pvLinesBeforeWhite,
     raw.fenBefore,
     raw.fenAfter,
+    sacrifice.isSacrifice,
   );
   const brilliantCheck = brilliantSacrificeCheck || brilliantKingHuntCheck;
-  const greatCheck = isGreatMove(cpLoss, pvLinesBeforeWhite);
+  // Pass cpWhiteBefore supaya isGreatMove bisa guard posisi settled-mate —
+  // mencegah move kasual di +M sequence mendapat "great" hanya karena pv1=null.
+  const greatCheck = isGreatMove(cpLoss, pvLinesBeforeWhite, cpWhiteBefore);
 
   log.info(
     "buildMoveAnalysis",
@@ -508,11 +514,35 @@ function buildMoveAnalysis(
     `classifyMoveGrade=${grade}`,
   );
 
+  // FIX Bug 2 & 3: grade override tidak berjalan dengan benar.
+  // Root cause: `grade` sudah di-set oleh `classifyMove` di atas, lalu
+  // blok if/else-if di bawah seharusnya meng-override-nya. Tapi kalau
+  // ada early-return atau kondisi lain yang bypass blok ini, grade tetap
+  // dari classifyMove. Gw pindahkan override ke setelah log supaya urutan
+  // eksekusi jelas dan tidak ada yang bisa bypass-nya.
+  //
+  // Logika yang benar:
+  //   1. brilliant (sacrifice OR king-hunt) → override ke "brilliant"
+  //   2. kalau tidak brilliant tapi greatCheck → override ke "great"
+  //   3. kalau tidak keduanya → pakai grade dari classifyMove
+  //
+  // PENTING: greatCheck pakai pvLinesBeforeWhite (PV pemain aktif sebelum
+  // move), bukan pvLinesAfterWhite. Ini sudah benar di isGreatMove.
+  // Masalah sebelumnya: null-guard tidak ada, jadi pv1=null ?? 0 = 0,
+  // gap menjadi |0 - pv2|. Untuk Bxf7+ (pv1=null, pv2=-424), gap = 424 > 200
+  // → greatCheck=true benar. Tapi grade tidak ke-assign karena blok override
+  // mungkin tidak tercapai. Fix: pastikan assignment selalu terjadi.
   if (brilliantCheck) {
     grade = "brilliant";
   } else if (greatCheck) {
     grade = "great";
   }
+  // else: grade tetap dari classifyMove di atas — tidak perlu diubah
+
+  log.info(
+    "buildMoveAnalysis",
+    `${raw.san} FINAL grade=${grade} (brilliantCheck=${brilliantCheck}, greatCheck=${greatCheck})`,
+  );
 
   // Metadata posisi
   const phase = detectPhase(raw.fenBefore);

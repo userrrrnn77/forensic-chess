@@ -194,6 +194,205 @@ function isWhiteToMove(fen: string): boolean {
   }
 }
 
+// ── Current-move from/to (buat highlight + badge di papan) ──────────────────
+
+interface CurrentMoveSquares {
+  from: string;
+  to: string;
+}
+
+/**
+ * MoveAnalysis.fen adalah FEN SEBELUM move dijalankan, dan move adalah SAN.
+ * Replay SAN itu di atas fen-nya buat dapetin {from, to} secara akurat
+ * (termasuk castling, en passant, promosi — semua udah dihandle chess.js).
+ */
+function getCurrentMoveSquares(
+  fenBefore: string,
+  san: string,
+): CurrentMoveSquares | null {
+  try {
+    const g = new Chess(fenBefore);
+    const result = g.move(san);
+    if (!result) return null;
+    return { from: result.from, to: result.to };
+  } catch {
+    return null;
+  }
+}
+
+function buildCurrentMoveHighlight(
+  squares: CurrentMoveSquares | null,
+  color: string,
+): Record<string, React.CSSProperties> {
+  if (!squares) return {};
+  const style: React.CSSProperties = { backgroundColor: color };
+  return { [squares.from]: style, [squares.to]: style };
+}
+
+// ── Status akhir game (checkmate / remis) ────────────────────────────────────
+
+export type GameEndKind =
+  | "checkmate"
+  | "stalemate"
+  | "insufficient"
+  | "repetition"
+  | "fiftyMove"
+  | "agreedDraw"
+  | "resignation"
+  | "timeout"
+  | "timeoutVsInsufficient"
+  | "abandoned";
+
+export interface GameEndBadge {
+  kind: GameEndKind;
+  winner: "white" | "black" | null; // null = remis
+}
+
+/**
+ * Cek hasil akhir game di posisi tertentu.
+ * 1) Coba deteksi dari FEN langsung via chess.js (checkmate/stalemate/dll
+ *    yang murni dari posisi papan).
+ * 2) Kalau FEN-nya ternyata bukan game-over (berarti game berakhir di luar
+ *    papan: timeout, resign, agreement) → fallback ke header [Termination]
+ *    / [Result] dari PGN.
+ * Return null kalau ini bukan posisi terakhir / game belum berakhir.
+ */
+function getGameEndBadge(
+  fen: string,
+  isLastPosition: boolean,
+  pgn: string,
+): GameEndBadge | null {
+  if (!isLastPosition) return null;
+
+  try {
+    const g = new Chess(fen);
+    if (g.isCheckmate()) {
+      // Sisi yang TIDAK jalan (g.turn()) adalah yang kena mat.
+      const winner = g.turn() === "w" ? "black" : "white";
+      return { kind: "checkmate", winner };
+    }
+    if (g.isStalemate()) return { kind: "stalemate", winner: null };
+    if (g.isInsufficientMaterial())
+      return { kind: "insufficient", winner: null };
+    if (g.isThreefoldRepetition()) return { kind: "repetition", winner: null };
+    if (g.isDraw()) return { kind: "fiftyMove", winner: null };
+  } catch {
+    /* fen invalid, lanjut ke fallback PGN */
+  }
+
+  // Fallback: parse header PGN. Cocok buat timeout/resign/agreement —
+  // hal-hal yang gak kebaca cuma dari posisi papan.
+  return parsePgnTermination(pgn);
+}
+
+function parsePgnTermination(pgn: string): GameEndBadge | null {
+  if (!pgn) return null;
+
+  let resultTag = "";
+  let terminationTag = "";
+  try {
+    const g = new Chess();
+    g.loadPgn(pgn, { strict: false });
+    const headers = g.getHeaders();
+    resultTag = headers.Result ?? "";
+    terminationTag = headers.Termination ?? "";
+  } catch {
+    // Fallback regex kalau loadPgn gagal (PGN parsial/aneh)
+    const resultMatch = pgn.match(/\[Result\s+"([^"]+)"\]/);
+    const termMatch = pgn.match(/\[Termination\s+"([^"]+)"\]/);
+    resultTag = resultMatch?.[1] ?? "";
+    terminationTag = termMatch?.[1] ?? "";
+  }
+
+  if (!resultTag && !terminationTag) return null;
+
+  const winner: "white" | "black" | null =
+    resultTag === "1-0" ? "white" : resultTag === "0-1" ? "black" : null;
+
+  const t = terminationTag.toLowerCase();
+
+  if (t.includes("checkmate") || t.includes("mat")) {
+    return { kind: "checkmate", winner };
+  }
+  if (t.includes("time") && t.includes("insufficient")) {
+    return { kind: "timeoutVsInsufficient", winner: null };
+  }
+  if (t.includes("time") || t.includes("abandon")) {
+    if (t.includes("abandon")) return { kind: "abandoned", winner };
+    return { kind: "timeout", winner };
+  }
+  if (t.includes("resign")) {
+    return { kind: "resignation", winner };
+  }
+  if (t.includes("agree")) {
+    return { kind: "agreedDraw", winner: null };
+  }
+  if (t.includes("repetition")) {
+    return { kind: "repetition", winner: null };
+  }
+  if (t.includes("50") || t.includes("fifty")) {
+    return { kind: "fiftyMove", winner: null };
+  }
+  if (t.includes("insufficient") || t.includes("material")) {
+    return { kind: "insufficient", winner: null };
+  }
+  if (t.includes("stalemate")) {
+    return { kind: "stalemate", winner: null };
+  }
+
+  // Gak ada Termination tag tapi ada Result decisive → asumsikan checkmate
+  // (paling umum kalau PGN-nya minimal/manual-paste tanpa header lengkap).
+  if (winner) return { kind: "checkmate", winner };
+  if (resultTag === "1/2-1/2") return { kind: "agreedDraw", winner: null };
+
+  return null;
+}
+
+function getGameEndDisplay(badge: GameEndBadge): {
+  label: string;
+  symbol: string;
+  bg: string;
+  ring: string;
+} {
+  switch (badge.kind) {
+    case "checkmate":
+      return { label: "Checkmate", symbol: "♚", bg: "#b33430", ring: "#fff" };
+    case "timeout":
+      return { label: "Timeout", symbol: "⏱", bg: "#b33430", ring: "#fff" };
+    case "timeoutVsInsufficient":
+      return {
+        label: "Timeout vs Insufficient Material",
+        symbol: "½",
+        bg: "#7a7a78",
+        ring: "#fff",
+      };
+    case "resignation":
+      return { label: "Resignation", symbol: "⚐", bg: "#b33430", ring: "#fff" };
+    case "abandoned":
+      return { label: "Abandoned", symbol: "⚐", bg: "#b33430", ring: "#fff" };
+    case "stalemate":
+      return { label: "Stalemate", symbol: "½", bg: "#7a7a78", ring: "#fff" };
+    case "insufficient":
+      return {
+        label: "Insufficient Material",
+        symbol: "½",
+        bg: "#7a7a78",
+        ring: "#fff",
+      };
+    case "repetition":
+      return {
+        label: "Threefold Repetition",
+        symbol: "½",
+        bg: "#7a7a78",
+        ring: "#fff",
+      };
+    case "fiftyMove":
+      return { label: "Draw", symbol: "½", bg: "#7a7a78", ring: "#fff" };
+    case "agreedDraw":
+      return { label: "Draw Agreed", symbol: "½", bg: "#7a7a78", ring: "#fff" };
+  }
+}
+
 // ============================================================================
 // GRADES & UI HELPERS
 // ============================================================================
@@ -206,6 +405,7 @@ export const GRADES = [
     color: "text-cyan-400",
     bg: "bg-cyan-400/10 border-cyan-400/20",
     dot: "#22d3ee",
+    squareColor: "rgba(34, 211, 238, 0.45)",
   },
   {
     key: "great",
@@ -214,6 +414,7 @@ export const GRADES = [
     color: "text-blue-400",
     bg: "bg-blue-400/10 border-blue-400/20",
     dot: "#60a5fa",
+    squareColor: "rgba(96, 165, 250, 0.45)",
   },
   {
     key: "best",
@@ -222,6 +423,7 @@ export const GRADES = [
     color: "text-green-400",
     bg: "bg-green-400/10 border-green-400/20",
     dot: "#4ade80",
+    squareColor: "rgba(74, 222, 128, 0.4)",
   },
   {
     key: "excellent",
@@ -230,6 +432,7 @@ export const GRADES = [
     color: "text-green-400",
     bg: "bg-green-400/10 border-green-400/20",
     dot: "#4ade80",
+    squareColor: "rgba(74, 222, 128, 0.35)",
   },
   {
     key: "good",
@@ -238,6 +441,7 @@ export const GRADES = [
     color: "text-slate-400",
     bg: "bg-white/5 border-white/5",
     dot: "#94a3b8",
+    squareColor: "rgba(148, 163, 184, 0.35)",
   },
   {
     key: "inaccuracy",
@@ -246,6 +450,7 @@ export const GRADES = [
     color: "text-yellow-400",
     bg: "bg-yellow-400/10 border-yellow-400/20",
     dot: "#facc15",
+    squareColor: "rgba(250, 204, 21, 0.4)",
   },
   {
     key: "mistake",
@@ -254,6 +459,7 @@ export const GRADES = [
     color: "text-orange-400",
     bg: "bg-orange-400/10 border-orange-400/20",
     dot: "#fb923c",
+    squareColor: "rgba(230, 145, 44, 0.45)",
   },
   {
     key: "blunder",
@@ -262,6 +468,7 @@ export const GRADES = [
     color: "text-red-500",
     bg: "bg-red-500/10 border-red-500/20",
     dot: "#ef4444",
+    squareColor: "rgba(179, 52, 48, 0.55)",
   },
   {
     key: "forced",
@@ -270,6 +477,7 @@ export const GRADES = [
     color: "text-slate-400",
     bg: "bg-white/5 border-white/5",
     dot: "#94a3b8",
+    squareColor: "rgba(148, 163, 184, 0.3)",
   },
   {
     key: "miss",
@@ -278,11 +486,83 @@ export const GRADES = [
     color: "text-rose-400",
     bg: "bg-rose-400/10 border-rose-400/20",
     dot: "#fb7185",
+    squareColor: "rgba(255, 119, 105, 0.45)",
   },
 ];
 
 export function getGradeDisplay(grade: MoveGrade) {
   return GRADES.find((g) => g.key === grade) || GRADES[4];
+}
+
+// ============================================================================
+// BOARD OVERLAY: badge grade / status akhir game di pojok kotak
+// ============================================================================
+
+/**
+ * Konversi algebraic square ("g3") jadi posisi persen {leftPct, topPct}
+ * dari pojok KANAN-ATAS kotak tersebut, relatif ke container papan 8x8.
+ * Menghormati boardOrientation (flip kalau orientation === "black").
+ */
+function squareToCornerPercent(
+  square: string,
+  orientation: "white" | "black",
+): { leftPct: number; topPct: number } {
+  const file = square.charCodeAt(0) - "a".charCodeAt(0); // 0-7 (a..h)
+  const rank = parseInt(square[1], 10) - 1; // 0-7 (1..8)
+
+  // Kolom grid kiri->kanan, baris grid atas->bawah (rank 8 di atas saat white-bottom)
+  const col = orientation === "white" ? file : 7 - file;
+  const row = orientation === "white" ? 7 - rank : rank;
+
+  // Pojok kanan-atas kotak = (col+1) secara horizontal, row secara vertikal
+  return {
+    leftPct: ((col + 1) / 8) * 100,
+    topPct: (row / 8) * 100,
+  };
+}
+
+/**
+ * Badge bundar nempel di pojok kanan-atas sebuah kotak papan, dipakai untuk
+ * grade move ("!!", "??", dst) maupun status akhir game (checkmate/remis).
+ * Posisinya absolute terhadap container papan (board wrapper harus position:
+ * relative & overflow visible supaya badge yang nongol di tepi gak terpotong).
+ */
+function BoardCornerBadge({
+  square,
+  orientation,
+  bg,
+  ring,
+  symbol,
+  title,
+}: {
+  square: string;
+  orientation: "white" | "black";
+  bg: string;
+  ring: string;
+  symbol: string;
+  title: string;
+}) {
+  const { leftPct, topPct } = squareToCornerPercent(square, orientation);
+  return (
+    <div
+      title={title}
+      className="absolute z-20 flex items-center justify-center rounded-full font-bold pointer-events-none select-none"
+      style={{
+        left: `${leftPct}%`,
+        top: `${topPct}%`,
+        width: "6.5%",
+        aspectRatio: "1 / 1",
+        transform: "translate(-50%, -50%)",
+        backgroundColor: bg,
+        border: `2px solid ${ring}`,
+        boxShadow: "0 2px 6px rgba(0,0,0,0.45)",
+        color: "#fff",
+        fontSize: "min(2.6vw, 15px)",
+        lineHeight: 1,
+      }}>
+      {symbol}
+    </div>
+  );
 }
 
 // ============================================================================
@@ -860,11 +1140,66 @@ export default function App() {
   const pairedMoves = useMemo(() => buildPairedMoves(positions), [positions]);
   const atStart = isAtStart(positions, currentMoveIdx);
   const atEnd = isAtEnd(positions, currentMoveIdx);
-  const highlightSquares = buildHighlightSquares(moveFrom);
+
+  // from/to square dari move yang sedang diliat (buat highlight + badge grade)
+  const currentMoveSquares = useMemo(() => {
+    if (!currentMoveAnalysis) return null;
+    return getCurrentMoveSquares(
+      currentMoveAnalysis.fen,
+      currentMoveAnalysis.move,
+    );
+  }, [currentMoveAnalysis]);
+
+  const gradeDisplay = currentMoveAnalysis
+    ? getGradeDisplay(currentMoveAnalysis.grade)
+    : null;
+
+  const gradeHighlightSquares = useMemo(
+    () =>
+      buildCurrentMoveHighlight(
+        currentMoveSquares,
+        gradeDisplay?.squareColor ?? "rgba(0, 255, 204, 0.4)",
+      ),
+    [currentMoveSquares, gradeDisplay],
+  );
+
+  // Klik manual (pilih piece) overrides highlight grade di square asalnya
+  const clickHighlightSquares = buildHighlightSquares(moveFrom);
+  const highlightSquares = useMemo(
+    () => ({ ...gradeHighlightSquares, ...clickHighlightSquares }),
+    [gradeHighlightSquares, clickHighlightSquares],
+  );
+
   const bestMoveArrowObj = useMemo(
     () => buildBestMoveArrows(boardPos, liveEval.bestMove),
     [boardPos, liveEval.bestMove],
   );
+
+  // Badge checkmate/remis: cuma muncul kalau lagi liat posisi TERAKHIR game
+  const gameEndBadge = useMemo(() => {
+    if (positions.length <= 1) return null;
+    const isLastPosition = currentMoveIdx === positions.length - 2;
+    return getGameEndBadge(boardPos, isLastPosition, pgnInput);
+  }, [boardPos, positions, currentMoveIdx, pgnInput]);
+
+  const gameEndKingSquare = useMemo(() => {
+    if (!gameEndBadge || gameEndBadge.kind !== "checkmate") return null;
+    try {
+      const g = new Chess(boardPos);
+      const loserColor = g.turn(); // sisi yang lagi giliran = sisi yang di-mat
+      const board = g.board();
+      for (const row of board) {
+        for (const cell of row) {
+          if (cell && cell.type === "k" && cell.color === loserColor) {
+            return cell.square;
+          }
+        }
+      }
+    } catch {
+      /* noop */
+    }
+    return null;
+  }, [boardPos, gameEndBadge]);
 
   const distW = analysisData?.moveDistribution.white ?? {};
   const distB = analysisData?.moveDistribution.black ?? {};
@@ -1136,13 +1471,13 @@ export default function App() {
                 </div>
                 <div>
                   <div className="font-bold text-sm tracking-wide">
-                    {players.black}
+                    {boardOrientation === "white" ? players.black : players.white}
                   </div>
                   {analysisData && (
                     <div className="text-[10px] text-slate-500 mt-0.5">
                       Akurasi:{" "}
                       <span className="text-purple-400 font-mono">
-                        {analysisData.accuracyByColor.black}%
+                        {boardOrientation === "white" ? analysisData.accuracyByColor.black : analysisData.accuracyByColor.white}%
                       </span>
                     </div>
                   )}
@@ -1151,8 +1486,8 @@ export default function App() {
             </div>
 
             {/* Board */}
-            <div className="w-full max-w-150 aspect-square bg-[#0a0b0e] rounded-xl border border-white/10 shadow-[0_0_40px_rgba(0,0,0,0.4)] overflow-hidden relative shrink-0">
-              <div className="w-full h-full">
+            <div className="w-full max-w-150 aspect-square bg-[#0a0b0e] rounded-xl border border-white/10 shadow-[0_0_40px_rgba(0,0,0,0.4)] overflow-visible relative shrink-0">
+              <div className="w-full h-full rounded-xl overflow-hidden">
                 <Chessboard
                   options={{
                     id: "main-board",
@@ -1170,6 +1505,36 @@ export default function App() {
                   }}
                 />
               </div>
+
+              {/* Overlay: badge grade move (current) + badge checkmate/remis */}
+              {currentMoveSquares && gradeDisplay && currentMoveAnalysis && (
+                <BoardCornerBadge
+                  square={currentMoveSquares.to}
+                  orientation={boardOrientation}
+                  bg={gradeDisplay.dot}
+                  ring="#ffffff"
+                  symbol={gradeDisplay.symbol}
+                  title={`${gradeDisplay.label}: ${currentMoveAnalysis.move}`}
+                />
+              )}
+              {gameEndBadge &&
+                (() => {
+                  const display = getGameEndDisplay(gameEndBadge);
+                  const anchorSquare =
+                    gameEndBadge.kind === "checkmate" && gameEndKingSquare
+                      ? gameEndKingSquare
+                      : (currentMoveSquares?.to ?? "h1");
+                  return (
+                    <BoardCornerBadge
+                      square={anchorSquare}
+                      orientation={boardOrientation}
+                      bg={display.bg}
+                      ring={display.ring}
+                      symbol={display.symbol}
+                      title={display.label}
+                    />
+                  );
+                })()}
             </div>
 
             {/* White player info */}
@@ -1180,13 +1545,13 @@ export default function App() {
                 </div>
                 <div>
                   <div className="font-bold text-sm tracking-wide text-cyan-400">
-                    {players.white}
+                    {boardOrientation === "white" ? players.white : players.black}
                   </div>
                   {analysisData && (
                     <div className="text-[10px] text-slate-500 mt-0.5">
                       Akurasi:{" "}
                       <span className="text-cyan-400 font-mono">
-                        {analysisData.accuracyByColor.white}%
+                        {boardOrientation === "white" ? analysisData.accuracyByColor.white : analysisData.accuracyByColor.black}%
                       </span>
                     </div>
                   )}
@@ -1473,7 +1838,7 @@ export default function App() {
                             return (
                               <div
                                 key={g.key}
-                                className="grid grid-cols-[2rem_1fr_2rem] items-center p-1.5 rounded-xl bg-white/5 border border-white/5 hover:bg-white/10 transition-all">
+                                className="grid grid-cols-[2rem_1fr_2rem] items-center p-1 rounded-xl bg-white/5 border border-white/5 hover:bg-white/10 transition-all">
                                 <span
                                   className={`text-center font-mono text-xs font-bold ${wc > 0 ? "text-white" : "text-white/15"}`}>
                                   {wc}
@@ -1481,7 +1846,7 @@ export default function App() {
                                 <div
                                   className={`flex items-center justify-center gap-2 ${g.color}`}>
                                   <div
-                                    className={`w-6 h-6 rounded-md ${g.bg} flex items-center justify-center font-bold text-xs border shrink-0`}>
+                                    className={`w-3 h-3 rounded-md ${g.bg} flex items-center justify-center font-bold text-xs border shrink-0`}>
                                     {g.symbol}
                                   </div>
                                   <span className="font-semibold text-[10px] tracking-wide w-16 text-center opacity-90">

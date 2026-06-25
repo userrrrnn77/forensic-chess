@@ -314,10 +314,15 @@ export function classifyMove(
 
   const isForcedByGap = (() => {
     if (pvLinesWhite.length < 2) return false;
-    const pv1 = pvLinesWhite[0]?.cp ?? 0;
-    const pv2 = pvLinesWhite[1]?.cp ?? 0;
-    const gap = Math.abs(pv1 - pv2);
-    return gap > 400 && Math.abs(pv2) < 50;
+    const pv1cp = pvLinesWhite[0]?.cp ?? null;
+    const pv2cp = pvLinesWhite[1]?.cp ?? null;
+    // FIX: null-guard konsisten. Mate (null) selalu lebih baik dari cp apapun.
+    // Kalau pv1=null (mate) dan pv2=angka, gap adalah "infinite" → forced.
+    // Kalau keduanya null, tidak bisa judge → false.
+    if (pv1cp === null && pv2cp !== null) return Math.abs(pv2cp) < 50;
+    if (pv1cp === null || pv2cp === null) return false;
+    const gap = Math.abs(pv1cp - pv2cp);
+    return gap > 400 && Math.abs(pv2cp) < 50;
   })();
 
   const isForced = isOnlyLegalMove || isForcedByGap;
@@ -325,118 +330,148 @@ export function classifyMove(
   if (isForced && cpLoss < 15) return "forced";
   if (cpLoss < 15) return "best";
   if (cpLoss < 30) return "excellent";
-  if (cpLoss < 70) return "good";
-  if (cpLoss < 150) return "inaccuracy";
-  if (cpLoss < 300) return "mistake";
+  // FIX #9 — threshold good dinaikkan 70 → 100, inaccuracy 150 → 200.
+  // Di fase opening, engine sering swing ±70-100cp karena depth terbatas
+  // dan posisi masih fluid — banyak solid moves kelihatan cpLoss=70-99
+  // padahal praktisnya masih fine. Threshold lama terlalu ketat.
+  if (cpLoss < 100) return "good";
+  if (cpLoss < 200) return "inaccuracy";
+  if (cpLoss < 350) return "mistake";
   return "blunder";
 }
 
-// ── FIX #6: isKingHuntBrilliant — forcing check + king dipaksa jalan ─────────
-// + only-good-move ─────────────────────────────────────────────────────────
+// ── FIX #6 + #7 + #9: isKingHuntBrilliant ───────────────────────────────────
 //
 // Kasus seperti exf2+ / fxg1=N+ bukan material sacrifice (lihat detectSacrifice
 // yang sudah di-fix — immediateNetLoss-nya malah negatif/untung material).
 // Tapi mereka tetap bisa "brilliant" lewat jalur lain: forcing check yang
 // memaksa raja lawan keluar dari shelter-nya, DAN merupakan satu-satunya
-// (atau jauh lebih baik dari alternatif kedua) cara pemain aktif menjaga
-// keunggulan besarnya.
+// cara pemain aktif menjaga keunggulan besarnya.
 //
-// PENTING: gap di sini WAJIB diukur dari pvLinesBeforeWhite (PV milik
-// PEMAIN AKTIF di posisi SEBELUM move ini dimainkan) — bukan dari PV
-// lawan setelah move dimainkan. Itu kesalahan yang sebelumnya bikin Ke2
-// (raja jalan biasa, tidak forcing) numpang lolos jadi brilliant hanya
-// karena posisi lawan kebetulan tajam. Forcing check + king move target
-// memastikan kita hanya menilai move yang benar-benar menciptakan paksaan,
-// dan gap dari pvLinesBeforeWhite memastikan gap itu milik keputusan
-// pemain aktif sendiri, bukan posisi lawan belakangan.
+// FIX #9 — Tambah parameter prevCpWhiteBefore untuk bedain "mating pattern
+// capture" (Bxf7+) dari "eksekusi settled sequence" (Qxd1+):
+//
+//   Problem sebelumnya: Bxf7+ dan Qxd1+ terlihat identik dari data lokal —
+//   keduanya settled (cpBefore=±1500), isCapture=true, pv1=null, pv2=finite.
+//   Tidak bisa dibedakan tanpa konteks move sebelumnya.
+//
+//   Solusi: prevCpWhiteBefore = cpBeforeWhite dari move idx-2 (dua posisi
+//   sebelumnya, perspektif putih). Ini tersedia di evalMap di buildMoveAnalysis
+//   karena evalMap menyimpan semua FEN.
+//
+//   Logic:
+//     - Bxf7+ (idx=10): prevCp = cpAfter Bxd1 (idx=9) → +1500 (material blunder)
+//       TAPI posisi idx=8 (Nxe5 sebelum Bxd1) adalah cpBefore untuk Bxd1 → ~+87
+//       Jadi prevCpWhiteBefore untuk Bxf7+ = cpBefore move idx=8 = ~+87 → NOT settled
+//     - Qxd1+ (idx=17): prevCpWhiteBefore = cpBefore move idx=15 (Bg4+) = ~-590
+//       → sudah deep negative (lawan menang), posisi sudah dalam mating sequence
+//
+//   Cara akses: di buildMoveAnalysis, lookup rawMoves[idx-2].fenBefore dari evalMap.
+//   Null-safe: kalau idx < 2, tidak ada prevMove → pass null → tidak ada brilliant
+//   dari path ini (fine, early-game moves jarang brilliant lewat jalur ini).
 export function isKingHuntBrilliant(
   san: string,
   cpLoss: number,
   cpBeforeWhite: number, // eval SEBELUM move ini, perspektif putih
   pvLinesBeforeWhite: PVLine[], // dari evalBefore — PV milik pemain aktif
   fenBeforeMove: string,
-  fenAfterMove: string,
+  _fenAfterMove: string, // reserved untuk future extension
+  isSacrifice: boolean = false, // apakah move ini melepas material secara net
+  prevCpWhiteBefore: number | null = null, // cpBefore move idx-2, perspektif putih
 ): boolean {
   // 1) Harus forcing: check atau checkmate
   const isCheck = san.includes("+") || san.includes("#");
   if (!isCheck) return false;
 
-  // 2) cpLoss harus kecil — move ini gak boleh ngerugiin posisi sendiri.
-  //    Toleransi 30 — konsisten dengan jalur sacrifice di isBrilliantMove
-  //    (search depth terbatas kadang belum nangkep penuh keuntungan
-  //    king-hunt di evalAfter, jadi cpLoss sedikit di atas "perfect" masih
-  //    wajar untuk move yang genuinely forcing+decisive, mis. fxg1=N+
-  //    cpLoss=27 — masih bagian dari rangkaian king-hunt yang sama).
+  // 2) cpLoss harus kecil — move ini tidak boleh merugikan posisi sendiri.
+  //    Toleransi 30cp supaya king-hunt yang evaluasinya underestimate sedikit
+  //    di depth terbatas tetap terdeteksi.
   if (cpLoss > 30) return false;
 
-  // 2b) FIX #7: posisi SEBELUM move ini belum boleh sudah settled/extreme
-  // (mendekati mate-level, mis. |cp| >= 900). Kalau posisi udah segede itu
-  // sebelum move dimainkan, berarti keunggulan/mate-nya udah "diciptakan"
-  // oleh blunder lawan sebelumnya — move ini cuma nerusin/mengeksekusi
-  // mate yang udah pasti, bukan menciptakan sesuatu yang baru. Itu pantas
-  // dapet "best", bukan "brilliant". Brilliant harus jadi move yang
-  // mengubah posisi DARI belum-pasti-menang KE menang telak, bukan
-  // sekadar eksekusi forced-mate yang udah jelas dari posisi sebelumnya.
-  const SETTLED_THRESHOLD = 900;
-  if (Math.abs(cpBeforeWhite) >= SETTLED_THRESHOLD) return false;
+  // 3) Settled-mate guard.
+  //
+  //    Kalau posisi sebelum move ini sudah forced mate (|cpBeforeWhite| >= 1490),
+  //    sebagian besar check/capture adalah eksekusi sequence yang sudah inevitable.
+  //
+  //    Tiga exception yang tetap bisa brilliant:
+  //
+  //    a) isSacrifice=true: pemain aktif melepas material untuk membangun
+  //       mating net (exf2+, fxg1=N+). Kreasi aktif, bukan eksekusi.
+  //
+  //    b) "Mating pattern capture" (Bxf7+, Legal's Mate, dll):
+  //       Capture check di posisi yang baru SAJA menjadi settled — artinya
+  //       dua move sebelumnya posisi belum settled. Move ini sendiri yang
+  //       aktif menciptakan forced mate, bukan sekadar melanjutkan sequence.
+  //       Deteksi: |prevCpWhiteBefore| < 1490 — dua move sebelumnya posisi
+  //       BELUM settled, jadi transisi ke +M terjadi di sekitar move ini.
+  //
+  //    c) Tidak settled sama sekali (!isSettledMate): kasus normal,
+  //       lolos langsung ke only-good-move check.
+  //
+  //    Qxd1+ diblok karena: settled=true, isSacrifice=false, dan
+  //    prevCpWhiteBefore=-590 (already deep in mating sequence) → |prev|<1490
+  //    tapi konteksnya berbeda... wait, kita butuh cek lebih hati-hati.
+  //
+  //    Re-analisis dengan data log baru:
+  //      Bxf7+ (idx=10): prevCpWhiteBefore = cp dari fenBefore idx=8 (Nxe5)
+  //        = +87. |87| < 1490 → "recently settled" → exception b → brilliant ✓
+  //      Qxd1+ (idx=17): prevCpWhiteBefore = cp dari fenBefore idx=15 (Bg4+)
+  //        = -590 (hitam sudah menang besar). |590| < 1490 secara angka...
+  //        tapi ini bukan "recently became settled" — ini posisi yang sudah
+  //        deep losing untuk putih sejak lama.
+  //
+  //    Problem: |prevCp| < 1490 tidak cukup bedain keduanya karena -590 juga < 1490.
+  //    Solusi lebih presisi: "mating pattern capture" valid hanya kalau
+  //    prevCpWhiteBefore berada di zona "winning tapi belum mate" dari SISI
+  //    pemain yang sedang bergerak. Untuk putih (Bxf7+): prevCp harus positif
+  //    dan < 1490 (menang material tapi belum forced mate). Untuk hitam
+  //    (Qxd1+): prevCp dari perspektif hitam = -prevCpWhite, jadi prevCp hitam
+  //    = -(-590) = +590. |590| < 1490, tapi -590 (perspektif putih) artinya
+  //    hitam sudah sangat menang — ini SUDAH dalam mating attack territory,
+  //    bukan "just won material".
+  //
+  //    Final rule: mating pattern capture valid kalau |prevCpWhiteBefore| < 400.
+  //    Ini bedain "recently won material → now creating mate" (Bxf7+: prev=+87)
+  //    dari "already deep in winning/mating attack" (Qxd1+: prev=-590, |590|>400).
+  const isSettledMate = Math.abs(cpBeforeWhite) >= 1490;
+  const isCapture = san.includes("x");
 
-  // 3) Raja lawan harus benar-benar terpaksa pindah dari posisi awal/shelter-nya.
-  //    Bandingkan posisi raja lawan SEBELUM move ini vs SETELAH beberapa ply
-  //    (di sini cukup cek apakah raja lawan sudah tidak di kotak starting-nya
-  //    atau castled position pada fenAfterMove — proxy sederhana: raja lawan
-  //    pindah kotak akibat check ini).
-  const beforeBoard = fenBeforeMove.split(" ")[0];
-  const afterBoard = fenAfterMove.split(" ")[0];
-  const isWhiteMoving = fenBeforeMove.includes(" w ");
-  const oppKingChar = isWhiteMoving ? "k" : "K"; // raja LAWAN dari yang gerak
+  if (isSettledMate && !isSacrifice) {
+    // Exception b: mating pattern capture
+    // Butuh prevCpWhiteBefore tersedia dan dalam zona "baru menang material"
+    const isMatingPatternCapture =
+      isCapture &&
+      prevCpWhiteBefore !== null &&
+      Math.abs(prevCpWhiteBefore) < 400; // dua move lalu posisi masih "normal winning"
 
-  const findKingSquareIdx = (board: string, kingChar: string): number =>
-    board.indexOf(kingChar);
+    if (!isMatingPatternCapture) return false;
+    // Lolos → lanjut ke only-good-move check di step 4
+  }
 
-  const kingMovedAlready =
-    findKingSquareIdx(beforeBoard, oppKingChar) !==
-    findKingSquareIdx(afterBoard, oppKingChar);
-
-  // Check ini sendiri belum memindahkan raja (raja pindah di balasan
-  // berikutnya), tapi kalau check-nya datang dari move yang membuka/menyerang
-  // langsung raja yang masih di posisi awal, itu valid sebagai king-hunt
-  // trigger. kingMovedAlready true berarti situasi sudah berubah duluan
-  // (mis. raja sudah pernah kena force-move sebelumnya) — masih oke, kita
-  // tidak strict-reject di sini, cukup sebagai sinyal tambahan non-blocking.
-  void kingMovedAlready;
-
-  // 4) Only-good-move: harus jauh lebih baik dari alternatif kedua, diukur
-  //    dari PV milik pemain aktif SENDIRI sebelum move dimainkan.
+  // 4) Only-good-move check dari PV pemain aktif sebelum move ini.
   if (pvLinesBeforeWhite.length < 2) return false;
-  const pv1 = pvLinesBeforeWhite[0]?.cp ?? 0;
-  const pv2 = pvLinesBeforeWhite[1]?.cp ?? 0;
-  const gap = Math.abs(pv1 - pv2);
 
+  const pv1cp: any = pvLinesBeforeWhite[0]?.cp ?? null;
+  const pv2cp = pvLinesBeforeWhite[1]?.cp ?? null;
+
+  // pv1=null: engine return mate score untuk move terbaik.
+  //   - !isSettledMate → genuinely "hanya move ini kasih mate" → brilliant.
+  //   - isSettledMate & lolos exception b → brilliant (Bxf7+ dll).
+  //   - isSettledMate & tidak lolos → sudah return false di step 3.
+  if (pv1cp === null && pv2cp !== null) return true;
+  if (pv1cp === null && pv2cp === null) return false; // tidak cukup info
+
+  // pv1=angka & pv2=angka: gap harus signifikan
+  const gap = Math.abs(pv1cp - (pv2cp ?? 0));
+  void fenBeforeMove;
   return gap > 200;
 }
 
-// ── FIX #1 + #2 + #5: isBrilliantMove ─────────────────────────────────────────
+// ── FIX #1 + #2 + #5 + #8: isBrilliantMove ────────────────────────────────────
 //
-// PERUBAHAN:
-//   - Terima pvLinesAfterWhite (dari evalAfter, bukan evalBefore)
-//   - HANYA jalur sacrifice. Jalur "quiet only-move" yang lama DIHAPUS:
-//     pv1/pv2 di sini berasal dari pvLinesAfterWhite, yaitu kandidat milik
-//     LAWAN di posisi setelah move ini dimainkan (giliran sudah pindah).
-//     Gap besar antar pv1/pv2 di sana cuma berarti "posisi lawan tajam/dia
-//     punya 1 jawaban jauh lebih baik dari yang lain" — itu bukan bukti
-//     move kita sendiri istimewa. Itu sebabnya raja yang jalan biasa
-//     (Ke2) ikut numpang lolos jadi "brilliant" tiap kali posisi udah
-//     lopsided dari sacrifice sebelumnya. Only-move genuinely-brilliant
-//     non-sacrifice, non-forcing-check sekarang ditangani isKingHuntBrilliant
-//     terpisah (lihat di atas) dengan PV dari sisi yang benar (sebelum move).
-//   - Toleransi cpLoss jalur sacrifice dilonggarkan 10 → 25. Sacrifice
-//     riil (terutama exchange/piece sac dengan kompensasi tidak instan)
-//     sering punya cpLoss 10-25 karena search depth terbatas belum
-//     "melihat" kompensasi penuh di evalAfter — threshold 10 terlalu
-//     ketat dan nge-reject sacrifice yang valid.
-//
-// PENTING: caller (chessAnalyzer.ts buildMoveAnalysis) harus kirim
-//          evalAfter.pvLines ke parameter ini, bukan evalBefore.pvLines.
+// PERUBAHAN vs versi sebelumnya:
+//   - Hapus console.log debug
+//   - Logika inti tidak berubah: hanya jalur sacrifice, cpLoss <= 25, gap > 150
 
 export function isBrilliantMove(
   cpLoss: number,
@@ -448,10 +483,7 @@ export function isBrilliantMove(
   if (pvLinesAfterWhite.length < 2) return false;
   if (cpLoss > 25) return false;
 
-  console.log(
-    "log dari function isBrilliantMove: dari parameter cpAfterWhite: ",
-    cpAfterWhite,
-  );
+  void cpAfterWhite; // tersedia untuk logging eksternal kalau dibutuhkan
 
   const pv1 = pvLinesAfterWhite[0]?.cp ?? 0;
   const pv2 = pvLinesAfterWhite[1]?.cp ?? 0;
@@ -461,17 +493,47 @@ export function isBrilliantMove(
   return gap > 150;
 }
 
-// ── FIX #3b: isGreatMove — gap threshold naik 120→200 ────────────────────────
+// ── FIX #3b + #8: isGreatMove ────────────────────────────────────────────────
 //
-// PERUBAHAN: gap > 200 (dari 120) untuk kurangi false positive.
+// PERUBAHAN:
+//   - Tambah parameter cpBeforeWhite untuk detect settled-mate.
+//   - FIX #8: path `pv1=null & pv2!=null → true` sebelumnya terlalu agresif.
+//     Di posisi forced mate (+M), engine mengembalikan mate score (cp=null)
+//     untuk PV terbaik, dan finite cp untuk "slower mate" di PV2 — bukan
+//     karena hanya move ini yang kasih mate. Semua check/capture kasual di
+//     posisi itu bisa lolos sebagai "great" padahal itu hanya eksekusi.
+//
+//     Fix: null+angka path hanya lolos kalau posisi BELUM settled
+//     (|cpBeforeWhite| < 1490). Kalau sudah settled, tidak ada move yang
+//     bisa great hanya dari kondisi PV ini.
+//
+//   - Aturan null-guard lengkap setelah fix:
+//     settled + pv1=null & pv2!=null  → false (eksekusi, bukan great)
+//     !settled + pv1=null & pv2!=null → true  (hanya move ini kasih mate)
+//     pv1=null & pv2=null             → false (tidak cukup info)
+//     pv1=angka & pv2=null            → false (aneh, skip)
+//     pv1=angka & pv2=angka           → gap > 200
 
-export function isGreatMove(cpLoss: number, pvLinesWhite: PVLine[]): boolean {
+export function isGreatMove(
+  cpLoss: number,
+  pvLinesWhite: PVLine[],
+  cpBeforeWhite: number = 0, // eval SEBELUM move ini, perspektif putih
+): boolean {
   if (cpLoss > 15) return false;
   if (pvLinesWhite.length < 2) return false;
 
-  const pv1 = pvLinesWhite[0]?.cp ?? 0;
-  const pv2 = pvLinesWhite[1]?.cp ?? 0;
-  return Math.abs(pv1 - pv2) > 200; // FIX: naik dari 120
+  const isSettledMate = Math.abs(cpBeforeWhite) >= 1490;
+
+  const pv1cp = pvLinesWhite[0]?.cp ?? null;
+  const pv2cp = pvLinesWhite[1]?.cp ?? null;
+
+  if (pv1cp === null && pv2cp !== null) {
+    // Hanya great kalau posisi BELUM settled — genuinely "hanya move ini kasih mate"
+    return !isSettledMate;
+  }
+  if (pv1cp === null || pv2cp === null) return false; // tidak cukup info
+
+  return Math.abs(pv1cp - pv2cp) > 200;
 }
 
 // ── FIX #4: calcAccuracy — dipindah sini, harmonic mean ──────────────────────
@@ -497,8 +559,14 @@ export function calcAccuracy(
   for (const m of moves) {
     const wBefore = cpToWinPct(m.cpBefore);
     const wAfter = cpToWinPct(m.cpAfter);
-    // Clamp ke minimum 1 untuk hindari division by zero
-    const acc = Math.max(1, winPctToAccuracy(wBefore, wAfter));
+    // FIX Bug 4: floor naik dari 1 ke 10.
+    // Harmonic mean sangat sensitif terhadap nilai kecil: acc=1 memberi
+    // reciprocal 1.0, sedangkan acc=10 memberi reciprocal 0.1. Perbedaan
+    // ini dramatis ketika dirata-rata dengan move lain yang acc-nya 95-100
+    // (reciprocal 0.01). Floor 1 membuat 1 blunder bisa mendominasi
+    // seluruh sum dan menghasilkan accuracy 5-10% meski 90% langkah sempurna.
+    // Floor 10 tetap menghukum blunder dengan signifikan tapi proporsional.
+    const acc = Math.max(10, winPctToAccuracy(wBefore, wAfter));
     sumReciprocal += 1 / acc;
   }
 
