@@ -33,13 +33,11 @@ import {
   generateExplanation,
   getAdaptiveMovetime,
   BATCH_MULTI_PV,
-  PARALLEL_WORKERS,
   TB_PIECE_THRESHOLD,
   _singleton,
   initSingleton,
   splitIntoChunks,
   workerNewGame,
-  initBatchWorker,
   queryTablebase,
   calcAccuracy,
 } from "../utils/moduleChess";
@@ -662,66 +660,34 @@ async function evalAllPositions(
 ): Promise<Map<string, PositionEval>> {
   const result = new Map<string, PositionEval>();
 
-  // De-dup
   const uniqueFens = [...new Set(fens)];
   const total = uniqueFens.length;
   let done = 0;
 
-  // Dapatkan batch workers (init kalau belum ada)
-  let workers: Worker[];
-  if (_singleton.batchWorkersPromise) {
-    workers = await _singleton.batchWorkersPromise;
-  } else {
-    workers = await Promise.all(
-      Array.from({ length: PARALLEL_WORKERS }, () => initBatchWorker()),
-    );
+  // Selalu pakai singleton — jangan spawn worker baru di sini
+  if (!_singleton.batchWorkersPromise) {
+    throw new Error("Singleton belum init — panggil initSingleton dulu");
   }
+  const workers = await _singleton.batchWorkersPromise;
 
   if (workers.length === 0) throw new Error("Tidak ada batch worker tersedia");
 
-  // Reset semua worker
   await Promise.all(workers.map((w) => workerNewGame(w)));
 
-  // Split FEN ke chunks
   const chunks = splitIntoChunks(uniqueFens, workers.length);
 
   await Promise.all(
     chunks.map(async ({ items, startIdx }, chunkIndex) => {
-      // FIX BUG #3 (worker assignment):
-      // Sebelumnya: workers[startIdx % workers.length]
-      // startIdx = chunkIndex * size, di mana size = ceil(uniqueFens.length / workers.length).
-      // startIdx % workers.length CUMA sama dengan chunkIndex kalau size kebetulan
-      // kelipatan rapi dari workers.length. Kalau nggak, beberapa chunk bisa
-      // ke-mapping ke worker yang sama sementara worker lain nganggur — eval
-      // jadi nggak benar-benar paralel, DAN dua chunk yang kebagian worker
-      // sama akan saling rebutan event listener "message" milik worker itu
-      // di evalPosition (race condition: hasil posisi A bisa nge-resolve
-      // promise milik posisi B kalau listener-nya nimpa).
-      //
-      // Fix: pakai index chunk itu sendiri untuk pilih worker — setiap chunk
-      // sudah unik dan jumlahnya <= workers.length (lihat splitIntoChunks),
-      // jadi modulo di sini cuma jaga-jaga, bukan sumber bug lagi.
       const worker = workers[chunkIndex % workers.length];
 
       for (let i = 0; i < items.length; i++) {
         const fen = items[i];
-        // Cek cache
         const cached = _singleton.evalCache.get(fen);
         if (cached) {
           result.set(fen, {
             fen,
             cp: cached.cp,
             pvLines: cached.pvLines,
-            // FIX BUG #2 (cache depth/fromTablebase):
-            // Sebelumnya selalu depth:0, fromTablebase:false untuk cache hit,
-            // padahal eval cache itu valid dan bisa saja berasal dari
-            // tablebase (depth 99) atau search dalam (depth tinggi). Kalau
-            // konsumen MoveAnalysis nanti pakai depth/fromTablebase untuk
-            // filter kualitas data, cache hit selalu kelihatan "dangkal"
-            // walau sebenarnya datanya bagus.
-            // EvalResult cache tidak menyimpan depth/fromTablebase secara
-            // eksplisit, jadi kita infer dari pvLines: tablebase selalu
-            // menyimpan depth 99 di line pertamanya.
             depth: cached.pvLines[0]?.depth ?? 0,
             fromTablebase: cached.pvLines[0]?.depth === 99,
           });
@@ -733,18 +699,13 @@ async function evalAllPositions(
         try {
           const ev = await evalPosition(worker, fen, startIdx + i);
           result.set(fen, ev);
-          // Simpan ke cache
-          _singleton.evalCache.set(fen, {
-            cp: ev.cp,
-            pvLines: ev.pvLines,
-          });
+          _singleton.evalCache.set(fen, { cp: ev.cp, pvLines: ev.pvLines });
         } catch (err) {
           log.warn(
             "evalAllPositions",
             `eval gagal untuk fen=${fen.slice(0, 20)}`,
             err,
           );
-          // Fallback: eval 0
           result.set(fen, {
             fen,
             cp: 0,

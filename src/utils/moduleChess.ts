@@ -48,7 +48,7 @@ export const STOP_GRACE_MS = 800;
 export const ZOMBIE_THRESHOLD = 3;
 export const MAX_RETRIES = 0;
 
-export const WORKER_INIT_TIMEOUT_MS = 8000;
+export const WORKER_INIT_TIMEOUT_MS = 15000;
 export const READYOK_TIMEOUT_MS = 3000;
 export const INIT_READYOK_TIMEOUT_MS = 15000;
 
@@ -840,13 +840,20 @@ export function splitIntoChunks<T>(
 }
 
 // ── Singleton init ────────────────────────────────────────────────────────────
+const _pendingReadyCallbacks: (() => void)[] = [];
 
 export function initSingleton(onReady: () => void) {
   if (_singleton.initialized) {
-    if (_singleton.isReady) onReady();
+    if (_singleton.isReady) {
+      onReady();
+    } else {
+      // Masih initializing — queue callback
+      _pendingReadyCallbacks.push(onReady);
+    }
     return;
   }
   _singleton.initialized = true;
+  _pendingReadyCallbacks.push(onReady);
 
   log.info(
     "init",
@@ -881,7 +888,10 @@ export function initSingleton(onReady: () => void) {
   liveWorker.addEventListener("message", (e: MessageEvent) => {
     if (typeof e.data === "string" && e.data === "uciok") {
       _singleton.isReady = true;
-      onReady();
+      // Flush semua pending callbacks
+      while (_pendingReadyCallbacks.length) {
+        _pendingReadyCallbacks.shift()?.();
+      }
     }
   });
 }

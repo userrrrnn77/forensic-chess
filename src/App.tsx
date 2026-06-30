@@ -29,7 +29,7 @@ import {
 } from "lucide-react";
 
 import { analyzeGame } from "./engine/chessAnalyzer";
-import { queryTablebase } from "./utils/moduleChess";
+import { _singleton, queryTablebase } from "./utils/moduleChess";
 import type {
   AnalysisData,
   ChessGameRecord,
@@ -1035,32 +1035,13 @@ export default function App() {
   // Live eval from singleton worker (from moduleChess _singleton.liveWorker)
   const [liveEval, setLiveEval] = useState<LiveEval>(EMPTY_EVAL);
   const [isLiveAnalyzing, setIsLiveAnalyzing] = useState(false);
-  const liveWorkerRef = useRef<Worker | null>(null);
   const liveEvalAbortRef = useRef<(() => void) | null>(null);
 
   const moveListRef = useRef<HTMLDivElement>(null);
 
-  // ── Boot live worker once ─────────────────────────────────────────────────
-  useEffect(() => {
-    const w = new Worker(
-      new URL("./engine/reckless.worker.ts", import.meta.url),
-      { type: "module" },
-    );
-    liveWorkerRef.current = w;
-
-    w.postMessage("uci");
-    w.postMessage(`setoption name MultiPV value 3`);
-    w.postMessage("setoption name Hash value 128");
-    w.postMessage("setoption name Threads value 1");
-
-    return () => {
-      w.terminate();
-    };
-  }, []);
-
   // ── Live eval a FEN via liveWorker ────────────────────────────────────────
   const analyzePositionLive = useCallback((fen: string) => {
-    const w = liveWorkerRef.current;
+    const w = _singleton.liveWorker;
     if (!w) return;
 
     // Cancel previous
@@ -1338,12 +1319,21 @@ export default function App() {
     if (!usernameInput.trim()) return;
     setIsLoading(true);
     try {
-      const date = new Date();
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, "0");
-      const res = await fetch(
-        `https://api.chess.com/pub/player/${usernameInput}/games/${year}/${month}`,
+      const archivesRes = await fetch(
+        `https://api.chess.com/pub/player/${usernameInput}/games/archives`,
       );
+      if (!archivesRes.ok) {
+        throw new Error("User not found");
+      }
+      const { archives } = await archivesRes.json();
+      if (!archives || archives.length === 0) {
+        alert("User ini belum punya game tercatat, Bre.");
+        setIsLoading(false);
+        return;
+      }
+      // archives urutannya dari lama -> baru, jadi tinggal ambil index terakhir
+      const latestArchiveUrl = archives[archives.length - 1];
+      const res = await fetch(latestArchiveUrl);
       const data = await res.json();
       const games: RawChessComGame[] = (data.games ?? []).slice(-10).reverse();
       setFetchedGames(mapRawGamesToRecords(games));
@@ -1471,13 +1461,18 @@ export default function App() {
                 </div>
                 <div>
                   <div className="font-bold text-sm tracking-wide">
-                    {boardOrientation === "white" ? players.black : players.white}
+                    {boardOrientation === "white"
+                      ? players.black
+                      : players.white}
                   </div>
                   {analysisData && (
                     <div className="text-[10px] text-slate-500 mt-0.5">
                       Akurasi:{" "}
                       <span className="text-purple-400 font-mono">
-                        {boardOrientation === "white" ? analysisData.accuracyByColor.black : analysisData.accuracyByColor.white}%
+                        {boardOrientation === "white"
+                          ? analysisData.accuracyByColor.black
+                          : analysisData.accuracyByColor.white}
+                        %
                       </span>
                     </div>
                   )}
@@ -1545,13 +1540,18 @@ export default function App() {
                 </div>
                 <div>
                   <div className="font-bold text-sm tracking-wide text-cyan-400">
-                    {boardOrientation === "white" ? players.white : players.black}
+                    {boardOrientation === "white"
+                      ? players.white
+                      : players.black}
                   </div>
                   {analysisData && (
                     <div className="text-[10px] text-slate-500 mt-0.5">
                       Akurasi:{" "}
                       <span className="text-cyan-400 font-mono">
-                        {boardOrientation === "white" ? analysisData.accuracyByColor.white : analysisData.accuracyByColor.black}%
+                        {boardOrientation === "white"
+                          ? analysisData.accuracyByColor.white
+                          : analysisData.accuracyByColor.black}
+                        %
                       </span>
                     </div>
                   )}
